@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,9 @@ JSON = Path(os.environ.get(
 class ChatSession(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if any(shutil.which(shlex.split(os.environ.get(var, default))[0]) is None
+               for var, default in [('CC', 'cc'), ('CXX', 'c++')]):
+            raise unittest.SkipTest('主机C/C++编译器不可用')
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         out = Path(cls.tmp.name)
@@ -25,6 +29,7 @@ class ChatSession(unittest.TestCase):
         types = source[source.index('enum phase_t'):source.index('/* 10 KB')]
         handlers = source[source.index('static int find_msg('):source.index('static void on_chat_ack(')]
         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
+        timeout = source[source.index('static void check_turn(void)'):source.index('/* ---- Inbound dispatch ---- */')]
         code = r'''
 #include <cassert>
 #include <cstdint>
@@ -37,14 +42,18 @@ class ChatSession(unittest.TestCase):
 #include "minimp3.h"
 #include "muse_chat_priv.h"
 #define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+#define CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 1
 ''' + constants + types + r'''
 static turn_t s_turn;
 static char s_reply_shown[EV_TEXT];
 static int64_t s_last_seq, s_marks[4];
 static int captions, console_events;
+static int64_t mock_time = 12345;
+static const char *failure;
 enum mark_t { M_TEXT, M_DONE };
 static void mark(mark_t) {}
-static int64_t now_us() { return 12345; }
+static int64_t now_us() { return mock_time; }
 static void emit(muse_hatch_ev_t type, const char *) {
     if (type == MUSE_HATCH_EV_REPLY) captions++;
 }
@@ -54,11 +63,14 @@ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
     strlcpy(out, text, cap); return text[0];
 }
 static void turn_finish() { s_turn.phase = P_IDLE; }
-static void turn_fail(const char *) { turn_finish(); }
+static void turn_fail(const char *why) { failure = why; turn_finish(); }
+static void turn_done(bool) { turn_finish(); }
+static void log_marks() {}
+static void on_dictation_end(bool) { turn_finish(); }
 static bool ensure_connected() { return true; }
 bool muse_hatch_configured() { return true; }
 static void resampler_init(resampler_t *, int, int) {}
-''' + reset + handlers + r'''
+''' + reset + handlers + timeout + r'''
 static void begin(bool typed = false) {
     assert(turn_start(s_turn.gen + 1, typed));
     s_turn.phase = P_WAIT_REPLY;
@@ -128,12 +140,77 @@ static void bounded_rejections() {
     event("message.assistant", "second", "note", "Second");
     assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
 }
+// 真正的订阅进展应延长等待，字幕首屏没有变化也不应误报停滞。
+static void easyinput_timeout() {
+    begin();
+    failure = nullptr;
+    s_turn.agent_busy = true;
+    s_turn.chat_us = s_turn.last_event_us = mock_time;
+    mock_time += 299999999;
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY && !failure);
+    ++mock_time;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && failure && !strcmp(failure, "NO REPLY PROGRESS (300s)"));
+
+    begin();
+    failure = nullptr;
+    s_turn.agent_busy = true;
+    s_turn.chat_us = s_turn.last_event_us = mock_time;
+    mock_time += 50000000;
+    static char full_text[MAX_MSGS * TEXT_MAX];
+    memset(full_text, 0, sizeof(full_text));
+    s_turn.texts = full_text;
+    event("delta.message_start", "reply", "note");
+    char long_text[256];
+    memset(long_text, 'a', sizeof(long_text)-1);
+    long_text[sizeof(long_text)-1] = '\0';
+    event("delta.text_append", "reply", "", long_text);
+    int first_caption = captions;
+    mock_time += 50000000;
+    event("delta.text_append", "reply", "", "suffix");
+    assert(captions == first_caption);
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY && !failure);
+    mock_time += 299999999;
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY && !failure);
+    ++mock_time;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && failure && !strcmp(failure, "NO REPLY PROGRESS (300s)"));
+
+    // 正在本地合成/播放的长回复不能被云端等待上限截断。
+    begin();
+    failure = nullptr;
+    s_turn.nmsgs = 1;
+    s_turn.msgs[0].done = true;
+    s_turn.msgs[0].tts = TTS_ACTIVE;
+    s_turn.start_us = s_turn.last_event_us = mock_time;
+    mock_time += 16 * 60 * 1000000LL;
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY && !failure);
+
+    s_turn.msgs[0].tts = TTS_FINISHED;
+    s_turn.last_event_us = mock_time - SETTLE_US;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && !failure);
+
+    // 持续忙碌但始终没有回复，也必须在总等待上限后明确报错。
+    begin();
+    failure = nullptr;
+    s_turn.agent_busy = true;
+    s_turn.start_us = mock_time - TEXT_TURN_CAP_US - 1;
+    s_turn.last_event_us = mock_time;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && failure && !strcmp(failure, "MUSE REPLY TIME LIMIT (900s)"));
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
     case 0: rejected_deltas(); break;
     case 1: valid_parents(); break;
     case 2: bounded_rejections(); break;
+    case 3: easyinput_timeout(); break;
     default: return 2;
     }
 }
@@ -166,3 +243,6 @@ int main(int argc, char **argv) {
 
     def test_rejection_capacity_preserves_correlation(self):
         self.run_case(2)
+
+    def test_easyinput_timeout_tracks_real_progress_with_unchanged_caption(self):
+        self.run_case(3)

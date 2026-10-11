@@ -67,6 +67,7 @@ set(GADGET_REQUIRES
     # is loaded, so this is unconditional; unused code is not linked.
     esp_driver_i2s
     esp_driver_pcnt
+    esp_adc
 )
 
 # E-paper has its own status screen in place of led_status.c, with
@@ -85,7 +86,11 @@ if(CONFIG_MUSE_ENABLED)
     list(APPEND GADGET_SRCS "muse_glue.c")
 endif()
 
-if(CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27 OR CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING OR CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
+if(CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2)
+    list(APPEND GADGET_SRCS "easyinput_board.c")
+endif()
+
+if(CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27 OR CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING OR CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE OR CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2)
     list(APPEND GADGET_REQUIRES led_strip)
 endif()
 
@@ -102,7 +107,9 @@ if(CONFIG_HOMEHUB_VOICE)
         "voice_muse_chat.c"
         "voice_player.c"
     )
-    if(CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
+    if(CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2)
+        list(APPEND GADGET_SRCS "voice_board_easyinput.c")
+    elseif(CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
         list(APPEND GADGET_SRCS "voice_board_respeaker_lite.c")
     else()
         list(APPEND GADGET_SRCS "voice_board.c")

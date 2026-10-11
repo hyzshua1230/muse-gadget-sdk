@@ -18,6 +18,7 @@
 #
 # Usage: board.sh BOARD [build|flash|monitor|flash-monitor] [PORT]
 #
+#   easyinput-v2  EasyInput V2.0 / AI Keyboard V2.1 (ESP32-S3), voice and five LEDs
 #   devkit     ESP32-C5 DevKitC-1 (status LED, no display)
 #   ideaspark  ideaspark ESP32 with a 1.9 inch ST7789 display
 #   sensecap-indicator
@@ -42,7 +43,7 @@
 # matching serial port, if there is exactly one.
 set -euo pipefail
 
-usage() { sed -n '16,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '16,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 [ $# -ge 1 ] || usage 2
 case "$1" in -h|--help) usage ;; esac
@@ -75,7 +76,7 @@ case "$BOARD" in
     DEFAULTS="$DEFAULTS;devices/sdkconfig.$BOARD"
     PORTS="/dev/cu.usbserial-* /dev/cu.wchusbserial* /dev/ttyUSB*"
     ;;
-  home-assistant-voice|seeed-respeaker-lite)
+  home-assistant-voice|seeed-respeaker-lite|easyinput-v2)
     TARGET=esp32s3
     DEFAULTS="$DEFAULTS;devices/sdkconfig.$BOARD"
     # The S3's own USB-Serial-JTAG, which looks like a DevKitC-1's; check

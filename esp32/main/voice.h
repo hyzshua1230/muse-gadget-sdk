@@ -28,6 +28,13 @@
 // the button whenever a turn can run.
 void voice_init(void);
 
+/* EasyInput：按键任务仅提交请求，音频任务执行取消；不会转为再次录音。 */
+void voice_cancel(void);
+/* 恢复设置等操作始终放弃当前任务，不解释为暂停。 */
+void voice_abort(void);
+void voice_toggle_mute(void);
+void voice_replay(void);
+
 // voice.configure: sets the speaker volume (0-100), kept in NVS. The dial on
 // top sets it too.
 cJSON *voice_configure_command(cJSON *params);

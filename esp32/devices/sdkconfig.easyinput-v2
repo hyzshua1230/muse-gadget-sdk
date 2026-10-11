@@ -1,0 +1,40 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# EasyInput V2.0 / AI Keyboard V2.1；依据 easyinput-board-cy 原理图与引脚表。
+# ESP32-S3R8，16MB W25Q128，8MB Octal PSRAM，原生 USB Serial/JTAG。
+# 加载于 sdkconfig.defaults 之后；共享电源由 easyinput_board.c 管理。
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2=y
+CONFIG_HOMEHUB_VOICE=y
+CONFIG_MUSE_ENABLED=n
+CONFIG_HOMEHUB_BLE_NAME_SUFFIX="-easyinput"
+CONFIG_HOMEHUB_BUTTON_GPIO=48
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_MODE_QUAD=n
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=n
+CONFIG_SPIRAM_MEMTEST=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse.csv"
+# OSS 的 GlobalSign R46 交叉签名链需使用证书包中的可信 R46 根。
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+CONFIG_HOMEHUB_QWEN_ASR=y

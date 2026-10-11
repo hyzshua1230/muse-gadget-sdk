@@ -14,6 +14,21 @@
 
 menu "ESP32 Device SDK"
 
+    config HOMEHUB_QWEN_TTS
+        bool "Qwen Chinese reply speech (EasyInput)"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE
+        default n
+
+    config HOMEHUB_QWEN_ASR
+        bool "Qwen Chinese speech recognition (EasyInput)"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE
+        default n
+
+    config HOMEHUB_QWEN_API_KEY
+        string "Qwen Beijing API key (local only)"
+        depends on HOMEHUB_QWEN_TTS || HOMEHUB_QWEN_ASR
+        default ""
+
     config GADGET_PRODUCT_NAME
         string "Human-visible product name for log messages"
         default "Muse Gadget"
@@ -222,6 +237,10 @@ menu "ESP32 Device SDK"
             bool "Waveshare ESP32-S3-1.54inch-ePaper SSD1681 e-paper (status screen)"
             depends on IDF_TARGET_ESP32S3 && SPIRAM
 
+        config HOMEHUB_LED_BACKEND_EASYINPUT_V2
+            bool "EasyInput V2.0 / AI Keyboard V2.1 five LEDs"
+            depends on IDF_TARGET_ESP32S3
+
         config HOMEHUB_LED_BACKEND_VOICE_RING
             bool "Home Assistant Voice PE 12-LED ring"
             depends on IDF_TARGET_ESP32S3
@@ -273,7 +292,7 @@ menu "ESP32 Device SDK"
 
     config HOMEHUB_VOICE
         bool "Push-to-talk voice chat"
-        depends on (HOMEHUB_LED_BACKEND_VOICE_RING || HOMEHUB_LED_BACKEND_RESPEAKER_LITE) && SPIRAM
+        depends on (HOMEHUB_LED_BACKEND_VOICE_RING || HOMEHUB_LED_BACKEND_RESPEAKER_LITE || HOMEHUB_LED_BACKEND_EASYINPUT_V2) && SPIRAM
         default y
         help
             Hold the centre button (XIAO BOOT on reSpeaker Lite), speak,

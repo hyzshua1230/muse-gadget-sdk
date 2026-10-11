@@ -78,6 +78,8 @@ typedef enum {
 } led_voice_t;
 
 void led_status_set_voice(led_voice_t voice);
+// EasyInput：1灯为识别/录音，2灯为合成，3灯为播放，5灯为其他错误。
+void led_status_set_voice_error(unsigned lights);
 // Microphone level for LED_VOICE_LISTENING, 0 to 1.
 void led_status_set_level(float level);
 // Show the speaker volume (0 to 100) on the ring for a moment, over whatever

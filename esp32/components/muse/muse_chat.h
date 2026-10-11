@@ -87,6 +87,17 @@ void muse_hatch_turn_end(void);
 /* Abandons the turn (tap, or barge-in during the reply). */
 void muse_hatch_turn_cancel(void);
 
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+/* 本地重播：语音任务读写游标，缓存所有权由互斥锁保护。 */
+void muse_hatch_replay_clear(void);
+void muse_hatch_replay_commit(void);
+/* offset 是16k输出样本位置；已到结尾时改为0，从头播放。 */
+bool muse_hatch_replay_begin(size_t *offset);
+size_t muse_hatch_replay_read(int16_t *pcm, size_t frames);
+/* TTS 分配大块内存前可丢弃未发布的缓存，保证正常合成优先。 */
+void muse_hatch_replay_make_room(size_t bytes);
+#endif
+
 typedef enum {
     MUSE_HATCH_EV_NONE,
     MUSE_HATCH_EV_HEARD,    /* transcript so far (partial while talking, then final) */

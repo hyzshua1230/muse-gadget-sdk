@@ -59,6 +59,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#include "freertos/semphr.h"
+#endif
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -72,6 +75,16 @@ extern "C" {
 #include "muse_wifi.h"
 }
 #include "muse_chat_priv.h"
+#if CONFIG_HOMEHUB_QWEN_ASR
+#include "muse_qwen_asr.h"
+static uint8_t *s_asr_record;
+#endif
+#if CONFIG_HOMEHUB_QWEN_TTS
+#include "muse_qwen_tts.h"
+static int16_t *s_qwen_pcm;
+static size_t s_qwen_frames, s_qwen_position;
+static bool s_qwen_requested;
+#endif
 
 #include <xplat/noise/core/ClientSession.h>
 #include <xplat/noise/core/PsaCryptoBackend.h>
@@ -98,7 +111,11 @@ static const char *TAG = "muse_chat_session";
 #define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
 #define EV_TEXT 72
+#if CONFIG_HOMEHUB_QWEN_TTS
+#define TEXT_MAX 32768 // 长回复保存在PSRAM，音频按段生成，不累计整条PCM。
+#else
 #define TEXT_MAX 1024                      /* a message's text, for captions timed to its speech */
+#endif
 #define SPEECH_CHARS_PER_S 14              /* until the speech's length is known */
 #define TEXT_CHARS_PER_S 16                /* speaker off: reading pace, a little over speech */
 #define TEXT_HOLD_S 2                      /* speaker off: how long a message's last lines stay up */
@@ -116,6 +133,7 @@ static const char *TAG = "muse_chat_session";
 #define TEXT_REPLY_TIMEOUT_US (5 * 60 * 1000000LL)   /* typed turns: agents can work a while */
 #define TEXT_TURN_CAP_US (15 * 60 * 1000000LL)
 #define TEXT_BUSY_HOLD_US (5 * 60 * 1000000LL)
+#define VOICE_AGENT_WAIT_US (5 * 60 * 1000000LL) // 搜索/思考允许连续5分钟没有内容。
 /*
  * The VM's streaming dictation has no ASR behind it right now, so each press
  * goes to the chat as a voice note, the way the phone app sends them, and the
@@ -190,7 +208,7 @@ static stream_t s_streams[MAX_STREAMS];
 
 /* ---- The current turn ---- */
 
-enum phase_t : uint8_t { P_IDLE, P_LISTEN, P_WAIT_FINAL, P_WAIT_REPLY };
+enum phase_t : uint8_t { P_IDLE, P_LISTEN, P_WAIT_FINAL, P_WAIT_REPLY, P_WAIT_ASR };
 
 enum tts_t : uint8_t { TTS_NONE, TTS_QUEUED, TTS_ACTIVE, TTS_FINISHED };
 
@@ -200,6 +218,7 @@ struct msg_t {
     char tail[128];          /* its last characters, for the caption */
     bool done;
     tts_t tts;
+    size_t tts_offset;       // Qwen下一段的UTF-8字节位置。
     uint32_t pcm_start;      /* where its speech starts in the reply audio */
     uint32_t pcm_frames;     /* how long it is; 0 until the MP3 has all arrived */
 };
@@ -938,6 +957,140 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
     return o;
 }
 
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+/* 保存原始 PCM 的所有权，避免额外复制整段音频。 */
+static SemaphoreHandle_t s_replay_lock;
+static constexpr unsigned REPLAY_PARTS = 64;
+static int16_t *s_replay_pcm[REPLAY_PARTS];
+static size_t s_replay_frames[REPLAY_PARTS], s_replay_bytes;
+static unsigned s_replay_count, s_replay_index;
+static size_t s_replay_position;
+static uint32_t s_replay_generation;
+static bool s_replay_valid;
+static constexpr size_t REPLAY_LIMIT = 4 * 1024 * 1024;
+
+static void replay_clear_locked(void)
+{
+    for (unsigned i = 0; i < s_replay_count; ++i) {
+        free(s_replay_pcm[i]);
+        s_replay_pcm[i] = nullptr;
+    }
+    s_replay_count = s_replay_index = 0;
+    s_replay_bytes = s_replay_position = 0;
+    s_replay_generation = 0;
+    s_replay_valid = false;
+}
+
+extern "C" void muse_hatch_replay_clear(void)
+{
+    if (!s_replay_lock) return;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    replay_clear_locked();
+    xSemaphoreGive(s_replay_lock);
+}
+
+extern "C" void muse_hatch_replay_make_room(size_t bytes)
+{
+    if (!s_replay_lock) return;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    if (s_replay_count && !s_replay_valid &&
+        (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < bytes + 128 * 1024 ||
+         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < bytes)) {
+        ESP_LOGW(TAG, "REPLAY CACHE NO MEMORY; preserving synthesis");
+        replay_clear_locked();
+    }
+    xSemaphoreGive(s_replay_lock);
+}
+
+static void replay_keep(int16_t *pcm, size_t frames, uint32_t generation)
+{
+    if (!s_replay_lock) { free(pcm); return; }
+    // 与首次播放使用相同的分块重采样，原地压缩为最终16kHz PCM。
+    resampler_t down;
+    resampler_init(&down, 24000, MIC_RATE);
+    int16_t chunk[256];
+    size_t written = 0;
+    for (size_t pos = 0; pos < frames;) {
+        size_t count = frames - pos;
+        if (count > 256) count = 256;
+        size_t n = resample(&down, pcm + pos, count, chunk);
+        memcpy(pcm + written, chunk, n * sizeof(int16_t));
+        written += n;
+        pos += count;
+    }
+    frames = written;
+    auto *compact = static_cast<int16_t *>(heap_caps_realloc(pcm, frames * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+    if (compact) pcm = compact;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    if (s_replay_generation == generation && frames &&
+        (s_replay_count == REPLAY_PARTS || frames > (REPLAY_LIMIT - s_replay_bytes) / 2)) {
+        ESP_LOGW(TAG, "REPLAY CACHE TOO LARGE");
+        replay_clear_locked();
+    }
+    if (s_replay_generation == generation && frames) {
+        s_replay_pcm[s_replay_count] = pcm;
+        s_replay_frames[s_replay_count++] = frames;
+        s_replay_bytes += frames * 2;
+    } else free(pcm);
+    xSemaphoreGive(s_replay_lock);
+}
+
+extern "C" void muse_hatch_replay_commit(void)
+{
+    if (!s_replay_lock) return;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    s_replay_valid = s_replay_generation == s_gen.load() && s_replay_count > 0;
+    if (s_replay_valid) ESP_LOGI(TAG, "replay cached: %u bytes, %u messages",
+                                (unsigned)s_replay_bytes, s_replay_count);
+    xSemaphoreGive(s_replay_lock);
+}
+
+extern "C" bool muse_hatch_replay_begin(size_t *offset)
+{
+    if (!s_replay_lock) return false;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    bool valid = s_replay_valid;
+    s_replay_index = 0;
+    s_replay_position = 0;
+    if (valid) {
+        size_t total = 0;
+        for (unsigned i = 0; i < s_replay_count; ++i)
+            total += s_replay_frames[i];
+        if (*offset >= total) *offset = 0;
+        size_t left = *offset;
+        while (s_replay_index < s_replay_count) {
+            size_t samples = s_replay_frames[s_replay_index];
+            if (left < samples) break;
+            left -= samples;
+            ++s_replay_index;
+        }
+        s_replay_position = left;
+    }
+    xSemaphoreGive(s_replay_lock);
+    return valid;
+}
+
+extern "C" size_t muse_hatch_replay_read(int16_t *pcm, size_t frames)
+{
+    if (!s_replay_lock || !frames) return 0;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    size_t n = 0;
+    while (!n && s_replay_valid && s_replay_index < s_replay_count) {
+        size_t count = s_replay_frames[s_replay_index] - s_replay_position;
+        if (count > frames) count = frames;
+        memcpy(pcm, s_replay_pcm[s_replay_index] + s_replay_position, count * sizeof(int16_t));
+        n = count;
+        s_replay_position += count;
+        if (s_replay_position == s_replay_frames[s_replay_index]) {
+            ++s_replay_index;
+            s_replay_position = 0;
+        }
+    }
+    xSemaphoreGive(s_replay_lock);
+    return n;
+}
+#endif
+
 /* ---- Turn: dictation ---- */
 
 static void turn_reset_streams(void)
@@ -953,6 +1106,18 @@ static void turn_reset_streams(void)
 
 static void turn_finish(void)
 {
+#if CONFIG_HOMEHUB_QWEN_ASR
+    muse_qwen_asr_cancel();
+    free(s_asr_record);
+    s_asr_record = nullptr;
+#endif
+#if CONFIG_HOMEHUB_QWEN_TTS
+    muse_qwen_tts_cancel();
+    free(s_qwen_pcm);
+    s_qwen_pcm = nullptr;
+    s_qwen_frames = s_qwen_position = 0;
+    s_qwen_requested = false;
+#endif
     turn_reset_streams();
     s_turn.phase = P_IDLE;
     s_turn.dict_id = s_turn.chat_id = 0;
@@ -963,6 +1128,9 @@ static void turn_finish(void)
 
 static void turn_fail(const char *why)
 {
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    if (!s_turn.text) muse_hatch_replay_clear();
+#endif
     ESP_LOGW(TAG, "turn failed: %s", why);
     if (s_turn.text) {
         muse_hatch_console("error", why, nullptr);
@@ -974,6 +1142,9 @@ static void turn_fail(const char *why)
 /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
 static void turn_done(bool complete)
 {
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    if (!complete && !s_turn.text) muse_hatch_replay_clear();
+#endif
     if (s_turn.text) {
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
@@ -1001,6 +1172,14 @@ static bool turn_start(uint32_t gen, bool text)
     s_turn.texts = texts;
     s_turn.gen = gen;
     s_turn.text = text;
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    if (!text && s_replay_lock) {
+        xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+        replay_clear_locked();
+        s_replay_generation = gen;
+        xSemaphoreGive(s_replay_lock);
+    }
+#endif
     s_turn.tts_msg = -1;
     memset(s_marks, 0, sizeof(s_marks));
     s_reply_shown[0] = '\0';
@@ -1018,6 +1197,15 @@ static void turn_begin(uint32_t gen)
     if (!turn_start(gen, false)) {
         return;
     }
+#if CONFIG_HOMEHUB_QWEN_ASR
+    s_asr_record = static_cast<uint8_t *>(psram_alloc(NOTE_MAX_BYTES));
+    if (!s_asr_record) {
+        turn_fail("QWEN ASR NO MEMORY");
+        return;
+    }
+    s_turn.phase = P_LISTEN;
+    return;
+#endif
     if (VOICE_NOTE) {
         if (!open_note()) {
             disconnect("chat open failed");
@@ -1039,7 +1227,7 @@ static void turn_begin(uint32_t gen)
 }
 
 /* Moves mic audio to the dictation stream, paced like a live mic. */
-static bool pump_mic(void)
+[[maybe_unused]] static bool pump_mic(void)
 {
     static int16_t in[MIC_RATE / 50];
     static int16_t up[MIC_RATE / 50 * DICT_RATE / MIC_RATE + 4];
@@ -1129,7 +1317,7 @@ static bool open_note(void)
 }
 
 /* Moves the mic into the note request; on release, sends the rest and waits for the reply. */
-static bool record_note(void)
+[[maybe_unused]] static bool record_note(void)
 {
     for (;;) {
         size_t room = NOTE_PART_BYTES - s_turn.note_len;
@@ -1216,6 +1404,46 @@ static void post_chat(const char *text)
     emit(MUSE_HATCH_EV_HEARD, text);
     send_chat(text, "text");
 }
+
+#if CONFIG_HOMEHUB_QWEN_ASR
+static void record_qwen(void)
+{
+    size_t room = NOTE_MAX_BYTES - s_turn.pcm_bytes;
+    if (room) s_turn.pcm_bytes += xStreamBufferReceive(s_in, s_asr_record + s_turn.pcm_bytes, room, 0);
+    if (!s_turn.end_requested && s_turn.pcm_bytes < NOTE_MAX_BYTES) return;
+    mark(M_RELEASE);
+    if (s_turn.pcm_bytes < MIC_RATE * 2 * 0.3) {
+        turn_fail("DIDN'T CATCH THAT");
+        return;
+    }
+    ESP_LOGI(TAG, "Qwen ASR recording: %.2fs", double(s_turn.pcm_bytes) / (MIC_RATE * 2));
+    s_turn.end_sent_us = now_us();
+    s_turn.phase = P_WAIT_ASR;
+    mark(M_SENT);
+}
+
+static void poll_qwen_asr(void)
+{
+    if (now_us() - s_turn.end_sent_us >= 60000000) {
+        turn_fail("QWEN ASR TIMEOUT");
+        return;
+    }
+    if (s_asr_record) {
+        // 取消的旧请求仍在退出时，保留新录音等待，不复用其结果。
+        if (muse_qwen_asr_busy()) return;
+        if (!muse_qwen_asr_start(s_asr_record, s_turn.pcm_bytes, s_turn.gen)) {
+            turn_fail("QWEN ASR START FAILED");
+            return;
+        }
+        free(s_asr_record); s_asr_record = nullptr;
+    }
+    char *text = nullptr;
+    int result = muse_qwen_asr_result(s_turn.gen, &text);
+    if (result > 0) post_chat(text);
+    else if (result < 0) turn_fail("QWEN ASR FAILED");
+    free(text);
+}
+#endif
 
 /* A typed turn: the text goes straight to the chat. */
 static void text_begin(const char *text)
@@ -1324,7 +1552,7 @@ static int bind_msg(const char *id, cJSON *payload)
     return s_turn.nmsgs++;
 }
 
-static void append_text(msg_t &m, const char *text)
+static bool append_text(msg_t &m, const char *text)
 {
     size_t add = strlen(text);
     if (s_turn.texts) {
@@ -1332,19 +1560,26 @@ static void append_text(msg_t &m, const char *text)
         if (!m.len) {
             full[0] = '\0';
         }
+#if CONFIG_HOMEHUB_QWEN_TTS
+        if (add >= TEXT_MAX - strlen(full)) {
+            turn_fail("TTS REPLY TOO LONG");
+            return false;
+        }
+#endif
         strlcat(full, text, TEXT_MAX);
     }
     m.len += add;
     size_t have = strlen(m.tail);
     if (add >= sizeof(m.tail) - 1) {
         strlcpy(m.tail, text + add - (sizeof(m.tail) - 1), sizeof(m.tail));
-        return;
+        return true;
     }
     if (have + add >= sizeof(m.tail)) {
         size_t drop = have + add - (sizeof(m.tail) - 1);
         memmove(m.tail, m.tail + drop, have - drop + 1);
     }
     strlcat(m.tail, text, sizeof(m.tail));
+    return true;
 }
 
 /*
@@ -1388,7 +1623,7 @@ static void message_done(int i, const char *final_text)
         return;
     }
     if (!m.len && final_text && final_text[0]) {
-        append_text(m, final_text);
+        if (!append_text(m, final_text)) return;
     }
     if (m.len && m.tts == TTS_NONE) {
         m.tts = TTS_QUEUED;
@@ -1464,7 +1699,7 @@ static void on_event(cJSON *line)
             muse_hatch_console("text", text, "\"msg\":%d", i);
         } else if (text && text[0]) {
             mark(M_TEXT);
-            append_text(m, text);
+            if (!append_text(m, text)) return;
             show_reply_start(m);   /* ignored once the speech starts */
         }
     } else if (done || full) {
@@ -1511,6 +1746,18 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
+#if CONFIG_HOMEHUB_QWEN_TTS
+        if (!s_turn.texts) { turn_fail("TTS TEXT UNAVAILABLE"); return; }
+        m.pcm_start = s_turn.pcm_out;
+        m.pcm_frames = 0;
+        m.tts_offset = 0;
+        m.tts = TTS_ACTIVE;
+        s_turn.tts_msg = i;
+        s_turn.silent = false;
+        s_qwen_requested = false;
+        show_reply_start(m);
+        return;
+#endif
         /*
          * Replies are text, shown at reading pace: silence in place of speech
          * paces the captions and ends the turn. To speak them instead, send
@@ -1587,6 +1834,79 @@ static void decode(void)
     if (s_turn.tts_msg < 0) {
         return;
     }
+#if CONFIG_HOMEHUB_QWEN_TTS
+    if (!s_qwen_requested) {
+        msg_t &m = s_turn.msgs[s_turn.tts_msg];
+        char *begin = s_turn.texts + s_turn.tts_msg * TEXT_MAX + m.tts_offset;
+        // 每次至多200个字符，优先在句末切分；一段播完就释放/缓存，再合成下一段。
+        char *end = begin;
+        char *sentence = nullptr;
+        unsigned chars = 0;
+        while (*end) {
+            if ((uint8_t(*end) & 0xc0) != 0x80 && chars++ == 200) break;
+            ++end;
+            if (chars >= 80 && (*end == '\n' || *end == '.' || *end == '!' || *end == '?' ||
+                !strncmp(end, "。", 3) || !strncmp(end, "！", 3) || !strncmp(end, "？", 3)))
+                sentence = end + (uint8_t(*end) < 128 ? 1 : 3);
+        }
+        if (*end && sentence) end = sentence;
+        char saved = *end;
+        *end = 0;
+        s_qwen_requested = muse_qwen_tts_start(begin, s_turn.gen);
+        *end = saved;
+        if (s_qwen_requested) {
+            m.tts_offset += end - begin;
+            s_turn.last_event_us = now_us();
+            ESP_LOGI(TAG, "Qwen speech segment queued: %u bytes", (unsigned)(end - begin));
+        }
+        return;
+    }
+    if (!s_qwen_pcm) {
+        int result = muse_qwen_tts_result(s_turn.gen, &s_qwen_pcm, &s_qwen_frames);
+        if (result < 0) { turn_fail("QWEN TTS FAILED"); return; }
+        if (!result) return;
+        s_qwen_position = 0;
+        resampler_init(&s_turn.down, 24000, MIC_RATE);
+        ESP_LOGI(TAG, "Qwen reply audio: 24000 Hz mono PCM16, %u frames", (unsigned)s_qwen_frames);
+        int peak = 0;
+        uint64_t energy = 0;
+        for (size_t i = 0; i < s_qwen_frames; ++i) {
+            int value = s_qwen_pcm[i];
+            int amplitude = value < 0 ? -value : value;
+            if (amplitude > peak) peak = amplitude;
+            energy += uint64_t(int64_t(value) * value);
+        }
+        ESP_LOGI(TAG, "Qwen PCM peak=%d mean_square=%llu", peak,
+                 (unsigned long long)(s_qwen_frames ? energy / s_qwen_frames : 0));
+    }
+    while (s_qwen_position < s_qwen_frames && xStreamBufferSpacesAvailable(s_out) >= 512) {
+        size_t count = s_qwen_frames - s_qwen_position;
+        if (count > 256) count = 256;
+        size_t n = resample(&s_turn.down, s_qwen_pcm + s_qwen_position, count, s_pcm16);
+        if (s_turn.gen != s_gen.load()) return;
+        xStreamBufferSend(s_out, s_pcm16, n * sizeof(int16_t), 0);
+        s_qwen_position += count;
+        s_turn.pcm_out += n;
+        if (n) s_turn.last_event_us = now_us();
+    }
+    if (s_qwen_position == s_qwen_frames) {
+        msg_t &m = s_turn.msgs[s_turn.tts_msg];
+        if (!s_turn.texts[s_turn.tts_msg * TEXT_MAX + m.tts_offset]) {
+            m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+            m.tts = TTS_FINISHED;
+            s_turn.tts_msg = -1;
+        }
+        s_qwen_requested = false;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        replay_keep(s_qwen_pcm, s_qwen_frames, s_turn.gen);
+#else
+        free(s_qwen_pcm);
+#endif
+        s_qwen_pcm = nullptr;
+        s_qwen_frames = s_qwen_position = 0;
+    }
+    return;
+#endif
     if (s_turn.silent) {
         pace_silently();
         return;
@@ -1658,9 +1978,32 @@ static void check_turn(void)
     if (s_turn.phase != P_WAIT_REPLY) {
         return;
     }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    // 云端搜索和思考允许等待5分钟；TTS/音频输出由自己的请求超时负责。
+    bool speaking = false;
+    for (int i = 0; i < s_turn.nmsgs; ++i)
+        speaking |= s_turn.msgs[i].tts == TTS_QUEUED || s_turn.msgs[i].tts == TTS_ACTIVE;
+    if (!speaking && t - s_turn.last_event_us >= VOICE_AGENT_WAIT_US) {
+        turn_fail("NO REPLY PROGRESS (300s)");
+        return;
+    }
+#endif
     bool text = s_turn.text;
-    if (t - s_turn.start_us > (text ? TEXT_TURN_CAP_US : TURN_CAP_US)) {
+    int64_t cap = text ? TEXT_TURN_CAP_US : TURN_CAP_US;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    cap = TEXT_TURN_CAP_US;
+    // 不在正在合成/播放时把正常长音频截断。
+    if (speaking) cap = INT64_MAX;
+    bool received = s_turn.nmsgs > 0 && !s_turn.agent_busy;
+    for (int i = 0; i < s_turn.nmsgs; ++i) received &= s_turn.msgs[i].done;
+    if (received) cap = INT64_MAX; // 音频输出完成后的收尾也不再计云端等待时间。
+#endif
+    if (t - s_turn.start_us > cap) {
         ESP_LOGW(TAG, "turn hit the time cap");
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        turn_fail("MUSE REPLY TIME LIMIT (900s)");
+        return;
+#endif
         /* A voice turn that waited out the cap on a busy agent got no reply at all. */
         if (!text && !s_turn.nmsgs) {
             turn_fail("NO REPLY FROM MUSE");
@@ -1671,7 +2014,11 @@ static void check_turn(void)
     }
     if (!s_turn.nmsgs) {
         /* Wait as long as the agent says it's working; the turn cap still applies. */
-        if (t - s_turn.chat_us > (text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US) && !s_turn.agent_busy) {
+        int64_t first_reply = text ? TEXT_REPLY_TIMEOUT_US : REPLY_TIMEOUT_US;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        first_reply = VOICE_AGENT_WAIT_US;
+#endif
+        if (t - s_turn.chat_us > first_reply && !s_turn.agent_busy) {
             turn_fail("NO REPLY FROM MUSE");
         }
         return;
@@ -1684,7 +2031,11 @@ static void check_turn(void)
     if (t - s_turn.last_event_us < SETTLE_US) {
         return;
     }
-    if (s_turn.agent_busy && t - s_turn.last_content_us < (text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US)) {
+    int64_t busy_hold = text ? TEXT_BUSY_HOLD_US : BUSY_HOLD_US;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    busy_hold = VOICE_AGENT_WAIT_US;
+#endif
+    if (s_turn.agent_busy && t - s_turn.last_content_us < busy_hold) {
         return;
     }
     ESP_LOGI(TAG, "turn done: %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);
@@ -1896,6 +2247,9 @@ static void handle(const cmd_t &cmd)
         }
         break;
     case CMD_FORGET:
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        muse_hatch_replay_clear();
+#endif
         if (s_turn.phase != P_IDLE) {
             turn_fail("SETTINGS CHANGED");
         }
@@ -1916,6 +2270,9 @@ static void handle(const cmd_t &cmd)
         break;
     case CMD_CANCEL:
         if (cmd.gen == s_turn.gen && !s_turn.text && s_turn.phase != P_IDLE) {
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+            muse_hatch_replay_clear();
+#endif
             ESP_LOGI(TAG, "turn cancelled");
             turn_finish();
         }
@@ -1982,8 +2339,15 @@ static void hatch_task(void *arg)
         }
         bool sent = true;
         if (s_turn.phase == P_LISTEN) {
+#if CONFIG_HOMEHUB_QWEN_ASR
+            record_qwen();
+#else
             sent = VOICE_NOTE ? record_note() : pump_mic();
+#endif
         }
+#if CONFIG_HOMEHUB_QWEN_ASR
+        if (s_turn.phase == P_WAIT_ASR) poll_qwen_asr();
+#endif
         if (!sent) {
             drop_connection("send failed");
             continue;
@@ -2036,6 +2400,10 @@ extern "C" void muse_hatch_start(void)
         return;
     }
     cJSON_Hooks hooks = { json_alloc, heap_caps_free };
+#if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    s_replay_lock = xSemaphoreCreateMutex();
+    if (!s_replay_lock) ESP_LOGW(TAG, "REPLAY CACHE NO MEMORY");
+#endif
     cJSON_InitHooks(&hooks);
     /* Keep the command/event queues out of internal DRAM, which Wi-Fi, BLE and
      * mbedTLS can exhaust: when the allocation failed here hatch_task never

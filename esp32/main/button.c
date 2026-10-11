@@ -22,6 +22,10 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#include "voice.h"
+#endif
+
 
 static const char *TAG = "link.button";
 
@@ -42,6 +46,53 @@ void button_set_press_cb(button_press_cb cb) {
 }
 #endif
 
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+static const int s_keys[9] = {2, 47, 38, 41, 1, 6, 7, 48, 18};
+static void button_task(void *arg) {
+    bool stable[9] = {0}, candidate[9] = {0}, fired = false;
+    unsigned ticks[9] = {0};
+    int64_t s8_start = 0;
+    for (;;) {
+        int64_t now = esp_timer_get_time();
+        for (int i = 0; i < 9; ++i) {
+            bool pressed = gpio_get_level(s_keys[i]) == 0;
+            if (pressed != candidate[i]) { candidate[i] = pressed; ticks[i] = 1; }
+            else if (ticks[i] < 2) ++ticks[i];
+            if (ticks[i] < 2 || stable[i] == pressed) continue;
+            stable[i] = pressed;
+            ESP_LOGI(TAG, "input %s%d %s", i < 8 ? "S" : "encoder", i < 8 ? i+1 : 1,
+                     pressed ? "down" : "up");
+            if (i == 0) {
+                /* S1 永远只属于语音，未认领时也不能变成配对或恢复键。 */
+#if CONFIG_HOMEHUB_VOICE
+                button_press_cb cb = s_press_cb;
+                if (cb) cb(pressed);
+#endif
+            }
+#if CONFIG_HOMEHUB_VOICE
+            else if (i == 1 && pressed) voice_toggle_mute();
+            else if (i == 2 && pressed) voice_replay();
+            else if (i == 3 && pressed) voice_cancel();
+#endif
+            else if (i == 7) {
+                if (pressed) { s8_start = now; fired = false; }
+                else if (!fired && now - s8_start <= SHORT_PRESS_MAX_MS * 1000LL) {
+                    if (s_short_press_cb) s_short_press_cb();
+                }
+            }
+        }
+        if (stable[7] && !fired && now - s8_start >= LONG_PRESS_MS * 1000LL) {
+            fired = true;
+#if CONFIG_HOMEHUB_VOICE
+            voice_abort();
+#endif
+            ESP_LOGI(TAG, "S8 reset setup");
+            if (s_long_press_cb) s_long_press_cb();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#else
 static void button_task(void *arg) {
     stack_monitor_t stack = STACK_MONITOR_INIT;
     bool was_pressed = false;
@@ -108,6 +159,8 @@ static void button_task(void *arg) {
     }
 }
 
+#endif
+
 bool button_init(button_cb on_short_press, button_cb on_double_press,
                  button_cb on_long_press) {
     s_short_press_cb = on_short_press;
@@ -121,14 +174,22 @@ bool button_init(button_cb on_short_press, button_cb on_double_press,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    cfg.pin_bit_mask = 0;
+    for (int i = 0; i < 9; ++i) cfg.pin_bit_mask |= 1ULL << s_keys[i];
+#endif
     esp_err_t err = gpio_config(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "gpio config failed: %s", esp_err_to_name(err));
         return false;
     }
 
-    xTaskCreate(button_task, "btn", 4096, NULL, 2, NULL);
+    if (xTaskCreate(button_task, "btn", 4096, NULL, 2, NULL) != pdPASS) return false;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    ESP_LOGI(TAG, "inputs ready: S1=talk S2=mute S3=resume/replay S4=pause/cancel S8=pair/reset(5s); other keys=diagnostic");
+#else
     ESP_LOGI(TAG, "button ready (GPIO %d: tap=retry wifi, 2x=rescan, hold %ds=reset setup)",
              BTN_GPIO, LONG_PRESS_MS / 1000);
+#endif
     return true;
 }

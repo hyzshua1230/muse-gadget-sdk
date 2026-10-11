@@ -17,6 +17,7 @@
 
 #include "voice_player.h"
 #include "voice_board.h"
+#include <stdatomic.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -45,6 +46,8 @@ static TaskHandle_t s_task;
 static volatile bool s_active;
 static volatile bool s_ended;
 static volatile bool s_started;
+static volatile esp_err_t s_error;
+static atomic_size_t s_played_samples;
 
 // 16 kHz mono to 48 kHz stereo 32-bit, by linear interpolation. `last`
 // carries the previous sample across chunks.
@@ -86,8 +89,15 @@ static void player_task(void *arg) {
                 continue;
             }
             size_t frames = upsample(in, got / sizeof(int16_t), out, &last);
-            voice_board_speaker_write(out, frames);
+            esp_err_t err = voice_board_speaker_write(out, frames);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "speaker output stopped: %s", esp_err_to_name(err));
+                s_error = err;
+                s_active = false;
+                break;
+            }
             s_started = true;
+            atomic_fetch_add(&s_played_samples, got / sizeof(int16_t));
         }
         vTaskDelay(pdMS_TO_TICKS(AMP_TAIL_MS));
         voice_board_amp(false);
@@ -118,6 +128,8 @@ void voice_player_begin(void) {
     xStreamBufferReset(s_buf);
     s_ended = false;
     s_started = false;
+    s_error = ESP_OK;
+    atomic_store(&s_played_samples, 0);
     s_active = true;
     xEventGroupClearBits(s_events, BIT_IDLE);
     xTaskNotifyGive(s_task);
@@ -150,4 +162,12 @@ void voice_player_stop(void) {
 
 bool voice_player_started(void) {
     return s_started;
+}
+
+esp_err_t voice_player_error(void) {
+    return s_error;
+}
+
+size_t voice_player_samples(void) {
+    return atomic_load(&s_played_samples);
 }

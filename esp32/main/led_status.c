@@ -33,9 +33,12 @@
 #elif CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27
 #include "led_strip.h"
 #include "soc/spi_pins.h"
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "driver/gpio.h"
 #include "led_strip.h"
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#include "easyinput_board.h"
+#endif
 #elif CONFIG_HOMEHUB_DISPLAY
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
@@ -94,10 +97,13 @@ static const char *TAG = "link.led";
 #endif
 #define LED_STRIP_LED_COUNT  1
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 // Home Assistant Voice PE: 12 WS2812 LEDs in a ring, index 0 at the top and
 // counting clockwise, powered through a switch on GPIO45.
-#if CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#define RING_GPIO 12
+#define RING_LEDS 5
+#elif CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
 // Seeed vendor pinout: XIAO D0=GPIO1; one WS2812, no power switch.
 #define RING_GPIO            1
 #define RING_LEDS            1
@@ -223,6 +229,9 @@ static led_voice_t s_voice = LED_VOICE_IDLE;
 static float s_level = 0;
 static int s_volume = 0;
 static int64_t s_volume_until = 0;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+static unsigned s_error_lights = 5;
+#endif
 #endif
 
 typedef struct {
@@ -327,7 +336,7 @@ static bool led_hw_init(void) {
     ESP_LOGI(TAG, "LED status ready: addressable RGB (GPIO=%d)", LED_STRIP_GPIO);
     return true;
 }
-#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+#elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 static led_strip_handle_t s_strip = NULL;
 // Steady frames shown since the ring last turned green for "connected".
 static int s_connected_frames = 0;
@@ -335,7 +344,16 @@ static int s_connected_frames = 0;
 static void ring_show(const rgb_t *px) {
     if (!s_strip) return;
     for (int i = 0; i < RING_LEDS; i++) {
-        if (led_strip_set_pixel(s_strip, i, px[i].r, px[i].g, px[i].b) != ESP_OK) return;
+        if (led_strip_set_pixel(s_strip, i,
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+                // 在原有通道上限基础上统一缩到约1/4，覆盖全部颜色与动画。
+                (px[i].r > 50 ? 50 : px[i].r) / 4,
+                (px[i].g > 50 ? 50 : px[i].g) / 4,
+                (px[i].b > 50 ? 50 : px[i].b) / 4
+#else
+                px[i].r, px[i].g, px[i].b
+#endif
+            ) != ESP_OK) return;
     }
     (void)led_strip_refresh(s_strip);
 }
@@ -893,7 +911,7 @@ static bool led_hw_init(void) {
 #endif
 
 #if !CONFIG_HOMEHUB_DISPLAY
-#if !(CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
+#if !(CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2)
 static void led_hw_set_connected(void) {
     led_hw_set_color(COLOR_GREEN);
 }
@@ -940,7 +958,11 @@ static void led_wait(int ms) {
 #if CONFIG_HOMEHUB_VOICE
 #define VOICE_FRAME_MS 40
 // Three 200 ms flashes.
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#define VOICE_ERROR_FRAMES 150 // 错误提示保留6秒，便于观察。
+#else
 #define VOICE_ERROR_FRAMES 30
+#endif
 // How long the volume stays up after the dial stops.
 #define VOICE_VOLUME_MS 1500
 
@@ -978,7 +1000,23 @@ static bool voice_render(void) {
     float level = s_level;
     int volume = s_volume;
     bool show_volume = esp_timer_get_time() < s_volume_until;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    unsigned error_lights = s_error_lights;
+#endif
     xSemaphoreGive(s_mutex);
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    led_state_t state;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    state = s_state;
+    xSemaphoreGive(s_mutex);
+    easyinput_board_green(state == LED_STATE_WS_CONNECTED);
+    if (state == LED_STATE_ERROR || (easyinput_board_muted() && voice != LED_VOICE_ERROR)) {
+        ring_fill((rgb_t){24, 0, 0});
+        led_wait(VOICE_FRAME_MS);
+        return true;
+    }
+    show_volume = show_volume && voice != LED_VOICE_ERROR && voice != LED_VOICE_LISTENING;
+#endif
     if (show_volume) {
         // Over any state; the state's animation picks up where it was.
         rgb_t px[RING_LEDS];
@@ -1002,8 +1040,18 @@ static bool voice_render(void) {
             // A level meter growing from the top down both sides, over a
             // faint ring that shows the microphone is open.
             for (int i = 0; i < RING_LEDS; i++) {
+                #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+                int from_top = i;
+#else
                 int from_top = i <= RING_LEDS / 2 ? i : RING_LEDS - i;
-                px[i] = from_top < level * (RING_LEDS / 2 + 1) ? COLOR_BLUE
+#endif
+                px[i] = from_top < level * (
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+                    RING_LEDS
+#else
+                    RING_LEDS / 2 + 1
+#endif
+                ) ? COLOR_BLUE
                                                                 : scaled(COLOR_BLUE, 0.08f);
             }
             break;
@@ -1025,7 +1073,11 @@ static bool voice_render(void) {
         }
         case LED_VOICE_ERROR:
             if ((frame / 5) % 2 == 0) {
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+                for (unsigned i = 0; i < error_lights; i++) px[i] = COLOR_RED;
+#else
                 for (int i = 0; i < RING_LEDS; i++) px[i] = COLOR_RED;
+#endif
             }
             break;
         default:
@@ -1123,7 +1175,7 @@ bool led_status_init(void) {
 
     led_hw_set_color(COLOR_ORANGE);
     // 2026-09-20: increase margin; measured only 904 bytes free with a 2048-byte stack.
-#if CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
+#if CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     // The RMT ring driver takes about 2 KB of the task's stack per frame.
     const uint32_t stack = 4096;
 #else
@@ -1160,6 +1212,17 @@ void led_status_set_voice(led_voice_t voice) {
     xSemaphoreGive(s_mutex);
     if (s_task) xTaskNotifyGive(s_task);
 }
+
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+void led_status_set_voice_error(unsigned lights) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_error_lights = lights >= 1 && lights <= 5 ? lights : 5;
+    s_voice = LED_VOICE_ERROR;
+    xSemaphoreGive(s_mutex);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+#endif
 
 void led_status_set_level(float level) {
     if (!s_mutex) return;

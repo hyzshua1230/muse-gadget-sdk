@@ -25,6 +25,10 @@
 #include <atomic>
 
 #include "esp_log.h"
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#include "easyinput_board.h"
+#endif
+
 #include "esp_timer.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
@@ -1552,6 +1556,13 @@ static void send_device_health(
         charging = cJSON_CreateBool(power.charging);
     }
     usb_power = cJSON_CreateBool(power.usb);
+#elif CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    int mv;
+    bool external, active_charging;
+    easyinput_board_power(&mv, &external, &active_charging);
+    if (mv > 0) battery_mv = cJSON_CreateNumber(mv);
+    usb_power = cJSON_CreateBool(external);
+    if (external) charging = cJSON_CreateBool(active_charging);
 #endif
     cJSON_AddItemToObject(metrics, "battery_pct",
                           battery_pct ? battery_pct : cJSON_CreateNull());

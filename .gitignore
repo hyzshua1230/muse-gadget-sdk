@@ -24,3 +24,6 @@ muse-simulator.ppm
 # Local gadget provisioning and original-device flash backups.
 .sdk-token
 /backups/
+
+# Local board build artifacts.
+/build-easyinput-v2/

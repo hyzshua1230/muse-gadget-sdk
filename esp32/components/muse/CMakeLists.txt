@@ -110,6 +110,13 @@ elseif(CONFIG_HOMEHUB_VOICE)
     list(APPEND embed "test_reply.mp3")
 endif()
 
+if(CONFIG_HOMEHUB_QWEN_TTS)
+    list(APPEND srcs "muse_qwen_tts.cpp")
+endif()
+if(CONFIG_HOMEHUB_QWEN_ASR)
+    list(APPEND srcs "muse_qwen_asr.cpp")
+endif()
+
 set(muse_priv_requires
     esp_timer esp_driver_usb_serial_jtag esp_psram nvs_flash
     bt esp-tls mbedtls esp_app_format esp_http_client

@@ -44,3 +44,7 @@ bool voice_player_wait(int timeout_ms);
 void voice_player_stop(void);
 // True once this reply has made a sound.
 bool voice_player_started(void);
+// 空闲只表示任务退出；输出错误必须单独检查。
+esp_err_t voice_player_error(void);
+// 成功提交到 I2S 的16k样本；停止并等待空闲后，DMA尾部也已播完。
+size_t voice_player_samples(void);
