@@ -116,6 +116,11 @@ if(CONFIG_HOMEHUB_VOICE)
     endif()
 endif()
 
+if(CONFIG_HOMEHUB_OFFLINE_WAKE)
+    list(APPEND GADGET_SRCS "voice_wake.c" "voice_wake_link_compat.cpp")
+    list(APPEND GADGET_REQUIRES esp-sr)
+endif()
+
 idf_component_register(
     SRCS ${GADGET_SRCS}
     INCLUDE_DIRS "."

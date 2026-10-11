@@ -89,6 +89,12 @@ void muse_hatch_turn_cancel(void);
 
 #if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 /* 本地重播：语音任务读写游标，缓存所有权由互斥锁保护。 */
+typedef enum {
+    MUSE_REPLAY_EMPTY, MUSE_REPLAY_READY, MUSE_REPLAY_TOO_LARGE,
+    MUSE_REPLAY_NO_MEMORY, MUSE_REPLAY_FAILED,
+} muse_replay_status_t;
+muse_replay_status_t muse_hatch_replay_status(void);
+void muse_hatch_replay_failed(void);
 void muse_hatch_replay_clear(void);
 void muse_hatch_replay_commit(void);
 /* offset 是16k输出样本位置；已到结尾时改为0，从头播放。 */

@@ -40,6 +40,11 @@
 #include "voice_board.h"
 #include "voice_muse_chat.h"
 #include "voice_player.h"
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+#include "voice_wake.h"
+#include "esp_bt.h"
+static bool s_auto_record;
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
 static atomic_uint s_cancel_epoch;
@@ -53,7 +58,11 @@ static const char *s_record_error;
 void voice_cancel(void) {
     // 已暂停时重复按S4不清除缓存；朗读前的S4仍取消任务。
 #if CONFIG_HOMEHUB_QWEN_TTS
-    if (atomic_load(&s_paused)) return;
+    if (atomic_load(&s_paused)) {
+        atomic_store(&s_resume_requested, false);
+        led_status_set_voice(LED_VOICE_IDLE);
+        return;
+    }
     if (atomic_load(&s_reply_active) && voice_player_started()) {
         atomic_fetch_add(&s_pause_epoch, 1);
         return;
@@ -71,7 +80,10 @@ void voice_abort(void) {
 void voice_toggle_mute(void) {
     bool muted = !easyinput_board_muted();
     easyinput_board_set_muted(muted);
-    if (muted) voice_cancel();
+    if (muted) {
+        atomic_store(&s_resume_requested, false);
+        voice_cancel();
+    }
     ESP_LOGI("link.voice", "software mute %s", muted ? "on" : "off");
 }
 
@@ -119,6 +131,7 @@ void voice_replay(void) {
         !atomic_compare_exchange_strong(&s_busy, &idle, true)) {
         if (!easyinput_board_muted() && atomic_load(&s_paused) && atomic_load(&s_busy)) {
             atomic_store(&s_resume_requested, true);
+            led_status_set_voice(LED_VOICE_REPLAY_WAIT);
             ESP_LOGI("link.voice", "resume requested; waiting for complete audio cache");
         }
         return;
@@ -179,6 +192,9 @@ static bool pressed_again(TickType_t wait) {
             if (evt.cancel_epoch != atomic_load(&s_cancel_epoch) || easyinput_board_muted()) continue;
             s_turn_epoch = evt.cancel_epoch;
 #endif
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+            s_auto_record = false; // S1打断后，下一轮恢复按住录音。
+#endif
             return true;
         }
         wait = 0;
@@ -196,7 +212,16 @@ static size_t record(void) {
     uint64_t energy = 0;
     size_t clipped = 0;
 #endif
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+    const bool automatic = s_auto_record;
+    bool heard_speech = false;
+    size_t silence_samples = 0;
+    int64_t speech_deadline = esp_timer_get_time() + 5000000;
+    int64_t capture_deadline = esp_timer_get_time() + CAPTURE_MAX_MS * 1000LL;
+    if (!automatic && voice_board_mic_start() != ESP_OK) return 0;
+#else
     if (voice_board_mic_start() != ESP_OK) return 0;
+#endif
     size_t samples = 0;
     int64_t stop_at = 0;
     while (samples < CAPTURE_MAX) {
@@ -204,12 +229,30 @@ static size_t record(void) {
         if (cancelled()) break;
 #endif
         voice_event_t evt;
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        if (automatic && esp_timer_get_time() >= capture_deadline) break;
+        if (automatic && xQueuePeek(s_events, &evt, 0) == pdTRUE && evt.kind == EVT_PRESS &&
+            evt.cancel_epoch == atomic_load(&s_cancel_epoch)) {
+            // 留在队列中让语音主循环接管，不提交自动录音的半句。
+            unsigned takeover_epoch = atomic_fetch_add(&s_cancel_epoch, 1) + 1;
+            xQueueReceive(s_events, &evt, 0);
+            evt.cancel_epoch = takeover_epoch;
+            xQueueSendToFront(s_events, &evt, 0);
+            break;
+        }
+#endif
         if (!stop_at && xQueueReceive(s_events, &evt, 0) == pdTRUE && evt.kind == EVT_RELEASE) {
             stop_at = esp_timer_get_time() + RELEASE_TAIL_MS * 1000LL;
         }
         if (stop_at && esp_timer_get_time() >= stop_at) break;
         int peak = 0;
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        bool speech = false;
+        size_t got = automatic ? voice_wake_read(chunk, CAPTURE_CHUNK, &speech, &peak)
+                                  : voice_board_mic_read(chunk, CAPTURE_CHUNK, &peak);
+#else
         size_t got = voice_board_mic_read(chunk, CAPTURE_CHUNK, &peak);
+#endif
         if (!got) {
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
             s_record_error = "MICROPHONE READ FAILED";
@@ -220,6 +263,19 @@ static size_t record(void) {
         if (cancelled()) break;
 #endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        if (automatic) {
+            if (!heard_speech && !speech) {
+                if (esp_timer_get_time() >= speech_deadline) {
+                    ESP_LOGI(TAG, "wake had no question; not submitted");
+                    break;
+                }
+                continue;
+            }
+            heard_speech = heard_speech || speech;
+            silence_samples = speech ? 0 : silence_samples + got;
+        }
+#endif
         if (muse_hatch_turn_audio_wait(chunk, got, 100) != got) {
             s_record_error = "MICROPHONE BACKLOG FULL";
             break;
@@ -235,8 +291,17 @@ static size_t record(void) {
 #endif
         samples += got;
         led_status_set_level(peak / 12000.0f);
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        if (automatic && silence_samples >= VOICE_MIC_RATE * 800 / 1000) break;
+#endif
     }
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+    if (automatic) {
+        if (voice_wake_stop() != ESP_OK) s_record_error = "MICROPHONE STOP FAILED";
+    } else voice_board_mic_stop();
+#else
     voice_board_mic_stop();
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     ESP_LOGI(TAG, "mic samples=%u peak=%d mean_square=%llu clipped=%u", (unsigned)samples,
              capture_peak, (unsigned long long)(samples ? energy / samples : 0), (unsigned)clipped);
@@ -250,7 +315,7 @@ static bool fail(const char *why) {
     ESP_LOGW(TAG, "turn failed: %s", why);
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #if CONFIG_HOMEHUB_QWEN_TTS
-    muse_hatch_replay_clear();
+    muse_hatch_replay_failed();
     atomic_store(&s_paused, false);
     atomic_store(&s_resume_requested, false);
     s_resume_at = 0;
@@ -381,6 +446,7 @@ static bool reply(void) {
 #if CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     if (paused) {
         muse_hatch_replay_commit();
+        led_status_set_voice(LED_VOICE_IDLE);
         ESP_LOGI(TAG, "paused reply complete; replay cache status logged above");
         return false;
     }
@@ -460,6 +526,12 @@ static bool run_turn(void) {
     if (samples < VOICE_MIC_RATE * CAPTURE_MIN_MS / 1000) {
         muse_hatch_turn_cancel();
         if (!samples) {
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+            if (s_auto_record && !s_record_error) {
+                led_status_set_voice(LED_VOICE_IDLE);
+                return false;
+            }
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
             return fail(s_record_error ? s_record_error : "MICROPHONE UNAVAILABLE");
 #else
@@ -508,10 +580,13 @@ static bool replay(void) {
     int16_t pcm[REPLY_CHUNK];
     size_t start = atomic_load(&s_paused) ? s_resume_at : 0;
     if (!muse_hatch_replay_begin(&start)) {
-        ESP_LOGI(TAG, "NO REPLAY AUDIO");
+        muse_replay_status_t status = muse_hatch_replay_status();
+        ESP_LOGI(TAG, "NO REPLAY AUDIO: status=%d", (int)status);
         atomic_store(&s_paused, false);
         s_resume_at = 0;
-        led_status_set_voice_error(3);
+        if (status == MUSE_REPLAY_FAILED) led_status_set_voice(LED_VOICE_ERROR);
+        else led_status_replay_notice(status == MUSE_REPLAY_TOO_LARGE ? 5 :
+                                      status == MUSE_REPLAY_NO_MEMORY ? 3 : 1);
         return false;
     }
     ESP_LOGI(TAG, "%s begin: sample=%u (%.2fs)", start ? "resume" : "replay", (unsigned)start,
@@ -598,6 +673,10 @@ static void voice_task(void *arg) {
         ESP_LOGI(TAG, "speaker prompt: 800Hz 120ms at volume %d", atomic_load(&s_volume));
     } else ESP_LOGW(TAG, "speaker prompt unavailable: no memory");
 #endif
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+    // 配对阶段保留内部RAM，等联网及蓝牙控制器释放后再加载模型。
+    bool wake_initialized = false;
+#endif
     atomic_store(&s_ready, true);
     if (xTaskCreate(dial_task, "dial", 3072, NULL, 3, NULL) != pdPASS) {
         ESP_LOGW(TAG, "no memory for the dial");
@@ -607,9 +686,60 @@ static void voice_task(void *arg) {
     for (;;) {
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
         voice_event_t evt;
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        s_auto_record = false;
+        if (xQueueReceive(s_events, &evt, 0) != pdTRUE) {
+            if (easyinput_board_muted() || atomic_load(&s_paused) ||
+                atomic_load(&s_busy) || !muse_hatch_ready() ||
+                esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE) {
+                if (voice_wake_stop() != ESP_OK) {
+                    fail("MICROPHONE STOP FAILED");
+                    vTaskSuspend(NULL);
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            if (!wake_initialized) {
+                esp_err_t wake_err = voice_wake_init();
+                if (wake_err != ESP_OK) {
+                    ESP_LOGE(TAG, "offline wake initialization failed: %s", esp_err_to_name(wake_err));
+                    led_status_set_voice_error(1);
+                    vTaskSuspend(NULL);
+                    continue;
+                }
+                wake_initialized = true;
+            }
+            esp_err_t err = voice_wake_start();
+            if (err != ESP_OK || voice_wake_error() != ESP_OK) {
+                fail("MICROPHONE WAKE FAILED");
+                vTaskSuspend(NULL);
+                continue;
+            }
+            if (!voice_wake_poll()) continue;
+            bool idle = false;
+            if (easyinput_board_muted() || !muse_hatch_ready() ||
+                !atomic_compare_exchange_strong(&s_busy, &idle, true)) {
+                voice_wake_stop();
+                continue;
+            }
+            s_auto_record = true;
+            evt = (voice_event_t){.kind = EVT_PRESS, .cancel_epoch = atomic_load(&s_cancel_epoch)};
+        } else if (evt.kind != EVT_RELEASE && voice_wake_stop() != ESP_OK) {
+            fail("MICROPHONE STOP FAILED");
+            vTaskSuspend(NULL);
+            continue;
+        }
+#else
         if (xQueueReceive(s_events, &evt, portMAX_DELAY) != pdTRUE) continue;
+#endif
         if (evt.kind == EVT_RELEASE) continue;
         if (evt.cancel_epoch != atomic_load(&s_cancel_epoch) || easyinput_board_muted()) {
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+            if (voice_wake_stop() != ESP_OK) {
+                fail("MICROPHONE STOP FAILED");
+                vTaskSuspend(NULL);
+            }
+#endif
             atomic_store(&s_busy, false);
             continue;
         }
@@ -619,6 +749,13 @@ static void voice_task(void *arg) {
         if (evt.kind == EVT_REPLAY) talk = replay();
 #endif
         if (talk) while (run_turn()) {}
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+        // 包括录音前取消或扬声器停止失败，都必须交还麦克风。
+        if (voice_wake_stop() != ESP_OK) {
+            fail("MICROPHONE STOP FAILED");
+            vTaskSuspend(NULL);
+        }
+#endif
         atomic_store(&s_reply_active, false);
         atomic_store(&s_busy, false);
 #if CONFIG_HOMEHUB_QWEN_TTS
@@ -642,9 +779,14 @@ void voice_init(void) {
     atomic_store(&s_volume, load_volume());
     voice_hatch_refresh();
     muse_hatch_start();
-    // The stack is in PSRAM, so the task must not touch flash (NVS): pairing
-    // needs an 8 KB internal block for its TLS task.
-    if (xTaskCreateWithCaps(voice_task, "voice", 4096, NULL, 4, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+    // 模型初始化会读取Flash并关闭缓存，执行该操作的任务栈必须在内部RAM。
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+    const uint32_t stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+#else
+    // 未启用模型时继续用PSRAM栈，保留配对TLS任务所需的内部RAM。
+    const uint32_t stack_caps = MALLOC_CAP_SPIRAM;
+#endif
+    if (xTaskCreateWithCaps(voice_task, "voice", 4096, NULL, 4, NULL, stack_caps) != pdPASS) {
         ESP_LOGE(TAG, "failed to start voice chat");
         return;
     }

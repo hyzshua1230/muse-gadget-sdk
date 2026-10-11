@@ -64,6 +64,7 @@
 #include "diagnostic_log.h"
 #if CONFIG_HOMEHUB_VOICE
 #include "voice.h"
+#include "voice_muse_chat.h"
 #endif
 #if CONFIG_HOMEHUB_SENSECAP_SENSORS
 #include "sensecap_sensors.h"
@@ -670,6 +671,10 @@ static bool complete_setup_and_stop_ble(const char *reason, uint32_t session_gen
     } else if (!config_mark_setup_complete()) {
         ESP_LOGW(TAG, "failed to mark setup complete");
     }
+#if CONFIG_HOMEHUB_VOICE
+    // 设置提交后同步语音缓存，让首次配网后无需S1即可进入唤醒监听。
+    voice_hatch_refresh();
+#endif
     setup_window_lock_take();
     advance_confirm_generation_locked();
     setup_window_lock_give();

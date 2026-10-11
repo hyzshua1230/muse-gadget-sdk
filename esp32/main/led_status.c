@@ -231,6 +231,9 @@ static int s_volume = 0;
 static int64_t s_volume_until = 0;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 static unsigned s_error_lights = 5;
+static unsigned s_notice_lights = 1;
+static unsigned s_notice_epoch;
+static int64_t s_wake_ready_until;
 #endif
 #endif
 
@@ -1002,6 +1005,10 @@ static bool voice_render(void) {
     bool show_volume = esp_timer_get_time() < s_volume_until;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     unsigned error_lights = s_error_lights;
+    unsigned notice_lights = s_notice_lights, notice_epoch = s_notice_epoch;
+    int64_t wake_ready_until = s_wake_ready_until;
+    static unsigned last_notice_epoch;
+    if (notice_epoch != last_notice_epoch) { frame = 0; last_notice_epoch = notice_epoch; }
 #endif
     xSemaphoreGive(s_mutex);
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
@@ -1015,7 +1022,8 @@ static bool voice_render(void) {
         led_wait(VOICE_FRAME_MS);
         return true;
     }
-    show_volume = show_volume && voice != LED_VOICE_ERROR && voice != LED_VOICE_LISTENING;
+    show_volume = show_volume && voice != LED_VOICE_ERROR && voice != LED_VOICE_LISTENING
+        && voice != LED_VOICE_REPLAY_WAIT && voice != LED_VOICE_REPLAY_NOTICE;
 #endif
     if (show_volume) {
         // Over any state; the state's animation picks up where it was.
@@ -1026,13 +1034,27 @@ static bool voice_render(void) {
         return true;
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (voice == LED_VOICE_ERROR && last == LED_VOICE_ERROR && frame >= VOICE_ERROR_FRAMES) {
+    if ((voice == LED_VOICE_ERROR && last == LED_VOICE_ERROR && frame >= VOICE_ERROR_FRAMES)
+        || (voice == LED_VOICE_REPLAY_NOTICE && last == voice && frame >= 40)) {
         voice = s_voice = LED_VOICE_IDLE;
     }
     xSemaphoreGive(s_mutex);
     if (voice != last) frame = 0;
     last = voice;
-    if (voice == LED_VOICE_IDLE) return false;
+    if (voice == LED_VOICE_IDLE) {
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        int64_t remaining = wake_ready_until - esp_timer_get_time();
+        if (remaining > 0) {
+            rgb_t ready[RING_LEDS] = {0};
+            float phase = 1.0f - (float)remaining / 800000;
+            ready[RING_LEDS / 2] = scaled((rgb_t){0, 12, 12}, sinf((float)M_PI * phase));
+            ring_show(ready);
+            led_wait(VOICE_FRAME_MS);
+            return true;
+        }
+#endif
+        return false;
+    }
 
     rgb_t px[RING_LEDS] = {0};
     switch (voice) {
@@ -1071,6 +1093,17 @@ static bool voice_render(void) {
             }
             break;
         }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        case LED_VOICE_REPLAY_WAIT: {
+            float breath = 0.5f - 0.5f * cosf(2 * (float)M_PI * frame / 50);
+            for (unsigned i = 0; i < 2; ++i) px[i] = scaled((rgb_t){48, 24, 0}, 0.2f + 0.8f * breath);
+            break;
+        }
+        case LED_VOICE_REPLAY_NOTICE:
+            if ((frame / 10) % 2 == 0)
+                for (unsigned i = 0; i < notice_lights; ++i) px[i] = (rgb_t){48, 24, 0};
+            break;
+#endif
         case LED_VOICE_ERROR:
             if ((frame / 5) % 2 == 0) {
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
@@ -1214,6 +1247,24 @@ void led_status_set_voice(led_voice_t voice) {
 }
 
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+void led_status_set_wake_listening(bool listening) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_wake_ready_until = listening ? esp_timer_get_time() + 800000 : 0;
+    xSemaphoreGive(s_mutex);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+void led_status_replay_notice(unsigned lights) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_notice_lights = lights >= 1 && lights <= 5 ? lights : 1;
+    ++s_notice_epoch;
+    s_voice = LED_VOICE_REPLAY_NOTICE;
+    xSemaphoreGive(s_mutex);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
 void led_status_set_voice_error(unsigned lights) {
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);

@@ -967,6 +967,7 @@ static unsigned s_replay_count, s_replay_index;
 static size_t s_replay_position;
 static uint32_t s_replay_generation;
 static bool s_replay_valid;
+static muse_replay_status_t s_replay_status = MUSE_REPLAY_EMPTY;
 static constexpr size_t REPLAY_LIMIT = 4 * 1024 * 1024;
 
 static void replay_clear_locked(void)
@@ -979,6 +980,7 @@ static void replay_clear_locked(void)
     s_replay_bytes = s_replay_position = 0;
     s_replay_generation = 0;
     s_replay_valid = false;
+    s_replay_status = MUSE_REPLAY_EMPTY;
 }
 
 extern "C" void muse_hatch_replay_clear(void)
@@ -986,6 +988,24 @@ extern "C" void muse_hatch_replay_clear(void)
     if (!s_replay_lock) return;
     xSemaphoreTake(s_replay_lock, portMAX_DELAY);
     replay_clear_locked();
+    xSemaphoreGive(s_replay_lock);
+}
+
+extern "C" muse_replay_status_t muse_hatch_replay_status(void)
+{
+    if (!s_replay_lock) return MUSE_REPLAY_NO_MEMORY;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    auto status = s_replay_status;
+    xSemaphoreGive(s_replay_lock);
+    return status;
+}
+
+extern "C" void muse_hatch_replay_failed(void)
+{
+    if (!s_replay_lock) return;
+    xSemaphoreTake(s_replay_lock, portMAX_DELAY);
+    replay_clear_locked();
+    s_replay_status = MUSE_REPLAY_FAILED;
     xSemaphoreGive(s_replay_lock);
 }
 
@@ -998,6 +1018,7 @@ extern "C" void muse_hatch_replay_make_room(size_t bytes)
          heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < bytes)) {
         ESP_LOGW(TAG, "REPLAY CACHE NO MEMORY; preserving synthesis");
         replay_clear_locked();
+        s_replay_status = MUSE_REPLAY_NO_MEMORY;
     }
     xSemaphoreGive(s_replay_lock);
 }
@@ -1026,6 +1047,7 @@ static void replay_keep(int16_t *pcm, size_t frames, uint32_t generation)
         (s_replay_count == REPLAY_PARTS || frames > (REPLAY_LIMIT - s_replay_bytes) / 2)) {
         ESP_LOGW(TAG, "REPLAY CACHE TOO LARGE");
         replay_clear_locked();
+        s_replay_status = MUSE_REPLAY_TOO_LARGE;
     }
     if (s_replay_generation == generation && frames) {
         s_replay_pcm[s_replay_count] = pcm;
@@ -1040,6 +1062,7 @@ extern "C" void muse_hatch_replay_commit(void)
     if (!s_replay_lock) return;
     xSemaphoreTake(s_replay_lock, portMAX_DELAY);
     s_replay_valid = s_replay_generation == s_gen.load() && s_replay_count > 0;
+    if (s_replay_valid) s_replay_status = MUSE_REPLAY_READY;
     if (s_replay_valid) ESP_LOGI(TAG, "replay cached: %u bytes, %u messages",
                                 (unsigned)s_replay_bytes, s_replay_count);
     xSemaphoreGive(s_replay_lock);

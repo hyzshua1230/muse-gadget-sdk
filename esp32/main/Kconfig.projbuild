@@ -14,6 +14,14 @@
 
 menu "ESP32 Device SDK"
 
+    config HOMEHUB_OFFLINE_WAKE
+        bool "ESP-SR offline wake word (EasyInput)"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE && HOMEHUB_QWEN_ASR
+        default n
+        help
+            Local Hi,lexin detection followed by automatic VAD-ended recording.
+            Requires the dedicated model partition and model image.
+
     config HOMEHUB_QWEN_TTS
         bool "Qwen Chinese reply speech (EasyInput)"
         depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE

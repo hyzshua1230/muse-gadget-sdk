@@ -75,11 +75,16 @@ typedef enum {
     LED_VOICE_BUFFERING,     // green comet: the reply is being synthesised
     LED_VOICE_SPEAKING,      // green breathing
     LED_VOICE_ERROR,
+    LED_VOICE_REPLAY_WAIT,   // EasyInput：两灯暖黄呼吸，等待完整缓存
+    LED_VOICE_REPLAY_NOTICE, // EasyInput：暖黄闪烁两次
 } led_voice_t;
 
 void led_status_set_voice(led_voice_t voice);
 // EasyInput：1灯为识别/录音，2灯为合成，3灯为播放，5灯为其他错误。
 void led_status_set_voice_error(unsigned lights);
+void led_status_replay_notice(unsigned lights);
+// EasyInput：实际进入唤醒监听时柔和提示一次；停止监听时取消。
+void led_status_set_wake_listening(bool listening);
 // Microphone level for LED_VOICE_LISTENING, 0 to 1.
 void led_status_set_level(float level);
 // Show the speaker volume (0 to 100) on the ring for a moment, over whatever

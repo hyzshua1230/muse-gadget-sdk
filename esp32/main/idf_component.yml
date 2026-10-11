@@ -13,6 +13,22 @@
 # limitations under the License.
 
 dependencies:
+  espressif/esp-sr:
+    version: "==2.6.0"
+    rules:
+      - if: "$CONFIG{HOMEHUB_OFFLINE_WAKE} == True"
+  espressif/esp-dl:
+    version: "==3.3.12"
+    rules:
+      - if: "$CONFIG{HOMEHUB_OFFLINE_WAKE} == True"
+  espressif/dl_fft:
+    version: "==0.6.0"
+    rules:
+      - if: "$CONFIG{HOMEHUB_OFFLINE_WAKE} == True"
+  espressif/esp_new_jpeg:
+    version: "==1.0.2"
+    rules:
+      - if: "$CONFIG{HOMEHUB_OFFLINE_WAKE} == True"
   espressif/esp_websocket_client: "~1.2"
   espressif/cjson: "~1.7"
   espressif/led_strip: "~3.0"

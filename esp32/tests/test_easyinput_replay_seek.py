@@ -36,6 +36,10 @@ class ReplaySeek(unittest.TestCase):
         functions = "\n".join(definition(source, name) for name in (
             "static void resampler_init(", "static size_t resample(",
             "static void replay_clear_locked(", "static void replay_keep(",
+            'extern "C" muse_replay_status_t muse_hatch_replay_status(',
+            'extern "C" void muse_hatch_replay_failed(',
+            'extern "C" void muse_hatch_replay_make_room(',
+            'extern "C" void muse_hatch_replay_commit(',
             'extern "C" bool muse_hatch_replay_begin(',
             'extern "C" size_t muse_hatch_replay_read(',
         ))
@@ -50,12 +54,20 @@ class ReplaySeek(unittest.TestCase):
 #define portMAX_DELAY 0
 #define MALLOC_CAP_SPIRAM 0
 #define ESP_LOGW(...) ((void)0)
+#define ESP_LOGI(...) ((void)0)
+static size_t free_bytes = 8 * 1024 * 1024, largest_bytes = free_bytes;
+static size_t heap_caps_get_free_size(int) { return free_bytes; }
+static size_t heap_caps_get_largest_free_block(int) { return largest_bytes; }
+struct { uint32_t load() { return 7; } } s_gen;
 static void *heap_caps_realloc(void *p, size_t bytes, int) { return realloc(p, bytes); }
 using SemaphoreHandle_t = void *;
 static void xSemaphoreTake(void *, int) {}
 static void xSemaphoreGive(void *) {}
 '''
         harness += definition(source, "struct resampler_t {") + ";\n"
+        header = (ROOT / "components/muse/muse_chat.h").read_text(encoding="utf-8")
+        start = header.index("typedef enum {\n    MUSE_REPLAY_EMPTY")
+        harness += header[start:header.index("} muse_replay_status_t;", start) + len("} muse_replay_status_t;")] + "\n"
         harness += declarations + functions
         harness += r'''
 int main() {
@@ -100,6 +112,33 @@ int main() {
     assert(!muse_hatch_replay_begin(&offset));
     int16_t chunk[320];
     assert(muse_hatch_replay_read(chunk, 320) == 0);
+    replay_clear_locked();
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_EMPTY);
+    muse_hatch_replay_failed();
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_FAILED);
+    replay_clear_locked();
+    s_replay_generation = 7;
+    replay_keep(static_cast<int16_t *>(calloc(256, 2)), 256, 7);
+    free_bytes = largest_bytes = 0;
+    muse_hatch_replay_make_room(1024);
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_NO_MEMORY);
+    muse_hatch_replay_commit();
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_NO_MEMORY);
+    replay_clear_locked();
+    s_replay_generation = 7;
+    s_replay_bytes = REPLAY_LIMIT;
+    replay_keep(static_cast<int16_t *>(calloc(256, 2)), 256, 7);
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_TOO_LARGE);
+    // 超限后后续片段不能变成一份貌似完整的缓存。
+    replay_keep(static_cast<int16_t *>(calloc(256, 2)), 256, 7);
+    muse_hatch_replay_commit();
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_TOO_LARGE);
+    assert(!muse_hatch_replay_begin(&offset));
+    replay_clear_locked();
+    s_replay_generation = 7;
+    replay_keep(static_cast<int16_t *>(calloc(256, 2)), 256, 7);
+    muse_hatch_replay_commit();
+    assert(muse_hatch_replay_status() == MUSE_REPLAY_READY);
     replay_clear_locked();
     return 0;
 }
