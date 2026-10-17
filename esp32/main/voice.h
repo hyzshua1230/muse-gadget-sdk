@@ -34,6 +34,10 @@ void voice_cancel(void);
 void voice_abort(void);
 void voice_toggle_mute(void);
 void voice_replay(void);
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+// S8短按提交故事事件，按键任务不执行网络或音频操作。
+void voice_story(void);
+#endif
 // EasyInput旋钮短按：请求切换音量/亮度模式。
 void voice_toggle_brightness_mode(void);
 

@@ -192,6 +192,23 @@ static void event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        if (CONFIG_HOMEHUB_WIFI_DNS_IPV4[0]) {
+            esp_netif_dns_info_t dns = {0};
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            esp_err_t err = esp_netif_str_to_ip4(CONFIG_HOMEHUB_WIFI_DNS_IPV4, &dns.ip.u_addr.ip4);
+            if (err == ESP_OK && dns.ip.u_addr.ip4.addr == 0) err = ESP_ERR_INVALID_ARG;
+            if (err == ESP_OK) err = esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+            if (err != ESP_OK) {
+                // 手动配置失败不能静默使用原DNS，也不能宣布联网就绪。
+                ESP_LOGE(TAG, "manual DNS failed: %s", esp_err_to_name(err));
+                xEventGroupClearBits(s_events, BIT_CONNECTED | BIT_GOT_IP);
+                xEventGroupSetBits(s_events, BIT_FAIL);
+                return;
+            }
+            ESP_LOGI(TAG, "manual DNS applied: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+        }
+#endif
         s_retry = 0;
         s_keep_connected = true;
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MIN_MS;  // reset on success

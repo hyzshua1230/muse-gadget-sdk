@@ -2144,7 +2144,11 @@ static void on_button_short_press(void) {
         return;
     }
 
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+    voice_story();
+#else
     ESP_LOGI(TAG, "button short-press ignored; setup already complete");
+#endif
 }
 
 static void on_button_double_press(void) {

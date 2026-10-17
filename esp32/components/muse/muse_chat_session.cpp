@@ -151,12 +151,16 @@ static const char *TAG = "muse_chat_session";
 
 /* ---- Voice task <-> session task ---- */
 
-enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE };
+enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE,
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+    CMD_PROMPT,
+#endif
+};
 
 struct cmd_t {
     cmd_type_t type;
     uint32_t gen;
-    char *text;              /* CMD_TEXT: malloc'd, freed by the session task */
+    char *text;              /* CMD_TEXT/CMD_PROMPT：内部复制，会话任务释放。 */
 };
 
 struct ev_t {
@@ -2298,6 +2302,19 @@ static void handle(const cmd_t &cmd)
             turn_begin(cmd.gen);
         }
         break;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+    case CMD_PROMPT:
+        if (cmd.gen == s_gen.load() && turn_start(cmd.gen, false)) {
+            // 连接期间也可能被取消，发送前再次核对，避免提交过期故事。
+            if (cmd.gen == s_gen.load()) {
+                // 使用可朗读轮次，只跳过采音与ASR；原串口文字轮次仍不朗读。
+                ESP_LOGI(TAG,"spoken prompt turn: %u bytes",(unsigned)strlen(cmd.text));
+                send_chat(cmd.text,"text");
+            } else turn_finish();
+        }
+        free(cmd.text);
+        break;
+#endif
     case CMD_END:
         if (cmd.gen == s_turn.gen && !s_turn.text && s_turn.phase == P_LISTEN) {
             s_turn.end_requested = true;
@@ -2495,6 +2512,24 @@ extern "C" void muse_hatch_turn_begin(void)
     drain_out();
     post(CMD_BEGIN, gen);
 }
+
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+extern "C" bool muse_hatch_prompt_turn(const char *text)
+{
+    if (!text || !*text || !muse_hatch_ready()) return false;
+    char *copy=strdup(text);
+    if (!copy) return false;
+    uint32_t gen=++s_gen;
+    xStreamBufferReset(s_in);
+    drain_out();
+    cmd_t cmd{CMD_PROMPT,gen,copy};
+    if (xQueueSend(s_cmds,&cmd,pdMS_TO_TICKS(100))!=pdTRUE) {
+        free(copy);
+        return false;
+    }
+    return true;
+}
+#endif
 
 extern "C" void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)
 {

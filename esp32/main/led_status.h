@@ -87,6 +87,9 @@ void led_status_replay_notice(unsigned lights);
 // EasyInput：实际进入唤醒监听时柔和提示一次；停止监听时取消。
 void led_status_set_wake_listening(bool listening);
 void led_status_show_brightness(void);
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+void led_status_set_story(bool story);
+#endif
 #if CONFIG_HOMEHUB_RADIO
 void led_status_radio_dark(bool dark);
 #endif

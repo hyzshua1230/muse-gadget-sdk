@@ -30,7 +30,12 @@
 
 #define MUSE_SSID_MAX 32
 #define MUSE_PASS_MAX 64
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+// 与当前板主连接的256字节地址缓冲一致，避免NVS读取因容量不足失败。
+#define MUSE_HOST_MAX 255
+#else
 #define MUSE_HOST_MAX 63
+#endif
 #define MUSE_VM_MAX 63
 #define MUSE_TOKEN_MAX 1023
 

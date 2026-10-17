@@ -65,8 +65,14 @@
 #endif
 
 static const char *TAG = "link.led";
-#if CONFIG_HOMEHUB_RADIO
+#if CONFIG_HOMEHUB_RADIO || CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include <stdatomic.h>
+#endif
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+static atomic_bool s_story;
+void led_status_set_story(bool story) { atomic_store(&s_story,story); }
+#endif
+#if CONFIG_HOMEHUB_RADIO
 static atomic_bool s_radio_dark;
 void led_status_radio_dark(bool dark) { atomic_store(&s_radio_dark, dark); }
 #endif
@@ -1172,6 +1178,14 @@ static bool voice_render(void) {
         default:
             break;
     }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    if (atomic_load(&s_story) && (voice==LED_VOICE_THINKING ||
+        voice==LED_VOICE_BUFFERING || voice==LED_VOICE_SPEAKING)) {
+        memset(px,0,sizeof(px));
+        float breath=0.2f+0.8f*(0.5f-0.5f*cosf(2*(float)M_PI*frame/80));
+        for (unsigned i=1;i+1<RING_LEDS;++i) px[i]=scaled((rgb_t){20,8,1},breath);
+    }
+#endif
     ring_show(px);
     frame++;
     vTaskDelay(pdMS_TO_TICKS(VOICE_FRAME_MS));

@@ -84,6 +84,10 @@ void muse_hatch_set_local_command_handler(bool (*handler)(const char *));
 
 /* Press: connects if needed and starts streaming speech to the VM. */
 void muse_hatch_turn_begin(void);
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+// 语音任务提交文字并朗读回复；不启动录音/ASR，输入由内部复制。
+bool muse_hatch_prompt_turn(const char *text);
+#endif
 /* 16 kHz mono speech, in order, from press to release. */
 void muse_hatch_turn_audio(const int16_t *pcm, size_t frames);
 /* Release: no more audio; the reply follows. */

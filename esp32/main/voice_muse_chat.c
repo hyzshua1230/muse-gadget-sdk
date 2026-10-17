@@ -24,6 +24,8 @@
 #include <stdatomic.h>
 #include <string.h>
 
+#include "esp_log.h"
+
 #include "freertos/FreeRTOS.h"
 
 #include "app.h"
@@ -43,7 +45,13 @@ static char s_host[MUSE_HOST_MAX + 1];
 
 void voice_hatch_refresh(void) {
     char host[MUSE_HOST_MAX + 1];
-    if (!config_get_str("noise_host", host, sizeof(host))) host[0] = '\0';
+    bool host_read = config_get_str("noise_host", host, sizeof(host));
+    if (!host_read) host[0] = '\0';
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    // 只记录读取结果和长度，不输出服务地址或凭据。
+    ESP_LOGI("link.voice", "session host: read=%d length=%u exceeds_old_limit=%d",
+             host_read, (unsigned)strlen(host), strlen(host) > 63);
+#endif
     portENTER_CRITICAL(&s_lock);
     strlcpy(s_host, host, sizeof(s_host));
     portEXIT_CRITICAL(&s_lock);

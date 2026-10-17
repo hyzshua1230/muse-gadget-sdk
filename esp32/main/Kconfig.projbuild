@@ -89,6 +89,16 @@ menu "ESP32 Device SDK"
             Password for CONFIG_HOMEHUB_WIFI_SSID. Ignored when the SSID
             override is empty.
 
+    config HOMEHUB_WIFI_DNS_IPV4
+        string "EasyInput manual IPv4 DNS (empty = DHCP)"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        default ""
+        help
+            Override the primary DNS server after each DHCP lease is obtained.
+            IP address and gateway still come from DHCP. Use a DNS server
+            reachable from the current network; clear this setting when changing
+            networks. No automatic alternate DNS server is added.
+
     config HOMEHUB_TOKEN_REFRESH_INTERVAL_DAYS
         int "Proactive device token refresh interval (days, 0 = disabled)"
         range 0 365
