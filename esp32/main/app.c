@@ -65,6 +65,13 @@
 #if CONFIG_HOMEHUB_VOICE
 #include "voice.h"
 #include "voice_muse_chat.h"
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+#include "network_feedback.h"
+static atomic_bool s_network_retry, s_network_attempt;
+void app_network_retry(void) {
+    if (!atomic_load(&s_network_attempt)) atomic_store(&s_network_retry,true);
+}
+#endif
 #endif
 #if CONFIG_HOMEHUB_SENSECAP_SENSORS
 #include "sensecap_sensors.h"
@@ -2144,6 +2151,56 @@ static void on_button_double_press(void) {
     ESP_LOGI(TAG, "button double-press ignored");
 }
 
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+// 当前无屏板由应用层统一管理首次失败及后续掉线，避免驱动重连与扫描争用。
+static void easyinput_keep_network(void) {
+    static int64_t wifi_next, service_next;
+    static unsigned wifi_attempt, service_attempt;
+    static const int seconds[]={5,10,20,30,60};
+    bool manual=atomic_exchange(&s_network_retry,false);
+    bool paired=config_setup_complete();
+    bool credentials=config_is_provisioned();
+    network_feedback_configure(paired,credentials);
+    if (!paired) { wifi_next=service_next=0; wifi_attempt=service_attempt=0; return; }
+    int64_t now=esp_timer_get_time();
+    if (!wifi_mgr_is_connected()) {
+        service_next=0; service_attempt=0;
+        if (!wifi_next) wifi_next=now+5000000;
+        if ((!manual && now<wifi_next) || wifi_mgr_joining(NULL,0) ||
+            !operation_gate_take(0,"network wifi recovery")) return;
+        char joined[WIFI_KNOWN_SSID_MAX+1]={0};
+        atomic_store(&s_network_attempt,true);
+        bool connected=CONFIG_HOMEHUB_WIFI_SSID[0] ?
+            wifi_mgr_connect(CONFIG_HOMEHUB_WIFI_SSID,CONFIG_HOMEHUB_WIFI_PASSWORD,WIFI_CONNECT_TIMEOUT_MS) :
+            join_saved_networks(WIFI_CONNECT_TIMEOUT_MS,JOIN_ANY,true,joined)==APP_WIFI_JOINED;
+        if (connected) {
+            ui_set_wifi(CONFIG_HOMEHUB_WIFI_SSID[0] ? CONFIG_HOMEHUB_WIFI_SSID : joined);
+            persist_connected_wifi_channel();
+            led_status_set_state(LED_STATE_WIFI_CONNECTED);
+            ESP_LOGI(TAG,"network wifi recovered");
+        }
+        operation_gate_give();
+        atomic_store(&s_network_attempt,false);
+        // 截止时间从本轮结束起算，避免长连接结束后立即密集重试。
+        if (wifi_attempt<4) ++wifi_attempt;
+        wifi_next=esp_timer_get_time()+(int64_t)seconds[wifi_attempt]*1000000;
+        if (!connected) return;
+    }
+    wifi_next=0; wifi_attempt=0;
+    if (!credentials || noise_ctrl_is_running()) { service_next=0; service_attempt=0; return; }
+    now=esp_timer_get_time();
+    if ((!manual && now<service_next) || !operation_gate_take(0,"network service recovery")) return;
+    atomic_store(&s_network_attempt,true);
+    bool connected=ensure_access_token_ready_with_gate_held(false,true) && connect_preferred_vm_with_gate_held(0);
+    operation_gate_give();
+    atomic_store(&s_network_attempt,false);
+    ui_set_status(connected ? "auth_ok" : "auth_failed");
+    led_status_set_state(connected ? LED_STATE_AUTH_OK : LED_STATE_ERROR);
+    service_next=esp_timer_get_time()+(int64_t)seconds[service_attempt]*1000000;
+    if (service_attempt<4) ++service_attempt;
+}
+#endif
+
 static void on_button_long_press(void) {
     reset_setup_from_control("button long-press");
 }
@@ -2699,7 +2756,13 @@ void app_run(void) {
         ESP_LOGI(TAG, "found provisioned creds in NVS, reconnecting (first: %s)", wifi_ssid);
     }
 
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE
+    network_feedback_configure(setup_complete,config_is_provisioned());
+#endif
     if (wifi_ssid) {
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE
+        atomic_store(&s_network_attempt,true);
+#endif
         ui_set_status("wifi_connecting");
         led_status_set_state(LED_STATE_WIFI_CONNECTING);
         char joined[WIFI_KNOWN_SSID_MAX + 1] = {0};
@@ -2753,6 +2816,9 @@ void app_run(void) {
     } else {
         ESP_LOGI(TAG, "no wifi creds, waiting for BLE provision");
     }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE
+    atomic_store(&s_network_attempt,false);
+#endif
 
 #if CONFIG_MUSE_ENABLED
     muse_glue_link_ready();
@@ -2769,6 +2835,9 @@ void app_run(void) {
 
 #if CONFIG_MUSE_ENABLED
         muse_keep_vm_session();
+#endif
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
+        easyinput_keep_network();
 #endif
 
         // Runs on every heartbeat tick, and does two things.

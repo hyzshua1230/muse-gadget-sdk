@@ -89,13 +89,14 @@ static bool channel_hint_valid(uint8_t channel) {
            || (channel >= 149 && channel <= 177 && (channel - 149) % 4 == 0);
 }
 
+static TimerHandle_t s_reconnect_timer = NULL;
+
+#if !(CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED)
 static void reconnect_timer_cb(TimerHandle_t t) {
     ESP_LOGI(TAG, "reconnect attempt (post-association)");
     atomic_store(&s_sta_idle, false);
     esp_wifi_connect();
 }
-
-static TimerHandle_t s_reconnect_timer = NULL;
 
 static void schedule_reconnect(void) {
     if (!s_reconnect_timer) {
@@ -115,6 +116,7 @@ static void schedule_reconnect(void) {
         s_reconnect_backoff_ms = RECONNECT_BACKOFF_MAX_MS;
     }
 }
+#endif
 
 #if CONFIG_MUSE_ENABLED
 // A saved channel only says where the last AP was: on a mesh, the node found
@@ -179,11 +181,14 @@ static void event_handler(void *arg, esp_event_base_t base,
             } else {
                 xEventGroupSetBits(s_events, BIT_FAIL);
             }
-        } else if (s_keep_connected) {
+        }
+#if !(CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED)
+        else if (s_keep_connected) {
             // Post-association drop. Reconnect forever with exponential backoff.
             ESP_LOGW(TAG, "wifi disconnected post-association, scheduling reconnect");
             schedule_reconnect();
         }
+#endif
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));

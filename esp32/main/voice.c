@@ -50,6 +50,7 @@ static bool s_auto_record;
 #endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
+#include "network_feedback.h"
 static atomic_uint s_cancel_epoch;
 static atomic_uint s_brightness_clicks;
 void voice_toggle_brightness_mode(void) { atomic_fetch_add(&s_brightness_clicks, 1); }
@@ -189,6 +190,11 @@ static void dial_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(DIAL_POLL_MS));
         int64_t now = esp_timer_get_time();
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        bool quiet=easyinput_board_muted() || atomic_load(&s_busy) || atomic_load(&s_paused);
+#if CONFIG_HOMEHUB_RADIO
+        quiet=quiet || radio_enabled();
+#endif
+        network_feedback_poll(quiet);
         if (atomic_exchange(&s_brightness_clicks, 0) & 1) {
 #if CONFIG_HOMEHUB_RADIO
             if (radio_select_confirm()) brightness_mode = false;
@@ -756,6 +762,83 @@ static bool replay(void) {
 }
 #endif
 
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+extern const uint8_t net_wifi_start[] asm("_binary_wifi_pcm_start");
+extern const uint8_t net_wifi_end[] asm("_binary_wifi_pcm_end");
+extern const uint8_t net_service_start[] asm("_binary_service_pcm_start");
+extern const uint8_t net_service_end[] asm("_binary_service_pcm_end");
+extern const uint8_t net_pair_start[] asm("_binary_pair_pcm_start");
+extern const uint8_t net_pair_end[] asm("_binary_pair_pcm_end");
+extern const uint8_t net_ready_start[] asm("_binary_ready_pcm_start");
+extern const uint8_t net_ready_end[] asm("_binary_ready_pcm_end");
+
+// 仅在语音任务空闲时播放；与回复使用同一播放器，S1/S2/S4能及时打断。
+static bool play_network_notice(network_notice_t notice) {
+    if (!notice || easyinput_board_muted() || atomic_load(&s_busy) || atomic_load(&s_paused)
+        || uxQueueMessagesWaiting(s_events) || !voice_player_wait(0)) return true;
+#if CONFIG_HOMEHUB_RADIO
+    if (radio_enabled()) return true;
+    if (!radio_pause(true)) { radio_pause(false); return true; }
+#endif
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+    if (voice_wake_stop()!=ESP_OK) {
+        ESP_LOGE(TAG,"network notice skipped: microphone did not stop");
+#if CONFIG_HOMEHUB_RADIO
+        radio_pause(false);
+#endif
+        return true;
+    }
+#endif
+    const uint8_t *start=NULL, *end=NULL;
+    if (notice==NET_NOTICE_WIFI) { start=net_wifi_start; end=net_wifi_end; }
+    if (notice==NET_NOTICE_SERVICE) { start=net_service_start; end=net_service_end; }
+    if (notice==NET_NOTICE_PAIR) { start=net_pair_start; end=net_pair_end; }
+    if (notice==NET_NOTICE_READY) { start=net_ready_start; end=net_ready_end; }
+    size_t samples=start ? (size_t)(end-start)/2 : VOICE_PLAYER_RATE/2;
+    unsigned epoch=atomic_load(&s_cancel_epoch);
+    ESP_LOGI(TAG,"local network notice=%d",notice);
+    voice_player_begin();
+    int16_t chunk[REPLY_CHUNK];
+    for (size_t offset=0;offset<samples;offset+=REPLY_CHUNK) {
+        if (easyinput_board_muted() || atomic_load(&s_busy) || uxQueueMessagesWaiting(s_events)
+            || atomic_load(&s_cancel_epoch)!=epoch || !network_feedback_notice_valid(notice)) break;
+#if CONFIG_HOMEHUB_RADIO
+        if (radio_enabled()) break;
+#endif
+        size_t n=samples-offset<REPLY_CHUNK ? samples-offset : REPLY_CHUNK;
+        for (size_t i=0;i<n;++i) {
+            size_t pos=offset+i;
+            float envelope=1;
+            if (pos<320) envelope=(float)pos/320;
+            if (samples-pos<320) envelope=(float)(samples-pos)/320;
+            if (start) chunk[i]=(int16_t)(((const int16_t *)start)[pos]*envelope/5);
+            else {
+                // 失败双音；恢复单个上行双音，总长不足半秒，包络防爆音。
+                size_t p=pos%(VOICE_PLAYER_RATE/4);
+                float e=p<320 ? (float)p/320 : p>2880 ? (float)(3200-p)/320 : 1;
+                float frequency=notice==NET_NOTICE_RECOVERED ? (pos<4000 ? 660 : 880) : (pos<4000 ? 660 : 440);
+                chunk[i]=p>=3200 ? 0 : (int16_t)(1200*e*sinf(2*(float)M_PI*frequency*pos/VOICE_PLAYER_RATE));
+            }
+        }
+        if (voice_player_write(chunk,n)!=ESP_OK) break;
+    }
+    voice_player_end();
+    while (!voice_player_wait(20)) {
+        bool interrupted=easyinput_board_muted() || atomic_load(&s_busy) || uxQueueMessagesWaiting(s_events)
+            || atomic_load(&s_cancel_epoch)!=epoch || !network_feedback_notice_valid(notice);
+#if CONFIG_HOMEHUB_RADIO
+        interrupted=interrupted || radio_enabled();
+#endif
+        if (interrupted) { voice_player_stop(); break; }
+    }
+    bool idle=voice_player_wait(1000);
+#if CONFIG_HOMEHUB_RADIO
+    if (idle) radio_pause(false);
+#endif
+    return idle;
+}
+#endif
+
 static void voice_task(void *arg) {
     if (voice_board_init() != ESP_OK || voice_player_init() != ESP_OK) {
         ESP_LOGE(TAG, "audio hardware unavailable; voice chat disabled");
@@ -804,6 +887,13 @@ static void voice_task(void *arg) {
         }
 #endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        if (!play_network_notice(network_feedback_take())) {
+#if CONFIG_HOMEHUB_RADIO
+            radio_release_pending=true;
+#endif
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
         voice_event_t evt;
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
         s_auto_record = false;

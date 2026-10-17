@@ -27,6 +27,7 @@
 #endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "voice.h"
+#include "network_feedback.h"
 #endif
 
 
@@ -54,7 +55,7 @@ static const int s_keys[9] = {2, 47, 38, 41, 1, 6, 7, 48, 18};
 static void button_task(void *arg) {
     bool stable[9] = {0}, candidate[9] = {0}, fired = false;
     unsigned ticks[9] = {0};
-    int64_t s8_start = 0, dial_start = 0;
+    int64_t s8_start = 0, dial_start = 0, s5_start = 0;
 #if CONFIG_HOMEHUB_RADIO
     int64_t s6_start = 0, s7_start = 0;
 #endif
@@ -79,6 +80,10 @@ static void button_task(void *arg) {
             else if (i == 1 && pressed) voice_toggle_mute();
             else if (i == 2 && pressed) voice_replay();
             else if (i == 3 && pressed) voice_cancel();
+            else if (i == 4) {
+                if (pressed) s5_start=now;
+                else if (now-s5_start<=SHORT_PRESS_MAX_MS*1000LL) network_feedback_request();
+            }
             else if (i == 8) {
                 if (pressed) dial_start = now;
                 else if (now - dial_start <= SHORT_PRESS_MAX_MS * 1000LL)
@@ -208,7 +213,7 @@ bool button_init(button_cb on_short_press, button_cb on_double_press,
 
     if (xTaskCreate(button_task, "btn", 4096, NULL, 2, NULL) != pdPASS) return false;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-    ESP_LOGI(TAG, "inputs ready: S1=talk S2=mute S3=resume/replay S4=pause/cancel S8=pair/reset(5s); other keys=diagnostic");
+    ESP_LOGI(TAG, "inputs ready: S1=talk S2=mute S3=resume/replay S4=pause/cancel S5=network status/retry S8=pair/reset(5s)");
 #else
     ESP_LOGI(TAG, "button ready (GPIO %d: tap=retry wifi, 2x=rescan, hold %ds=reset setup)",
              BTN_GPIO, LONG_PRESS_MS / 1000);

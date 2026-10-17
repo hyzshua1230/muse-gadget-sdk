@@ -38,6 +38,9 @@
 #include "led_strip.h"
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
+#if CONFIG_HOMEHUB_VOICE
+#include "network_feedback.h"
+#endif
 #include "config_store.h"
 #include <stdlib.h>
 #endif
@@ -1028,7 +1031,13 @@ static bool voice_render(void) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     state = s_state;
     xSemaphoreGive(s_mutex);
+#if CONFIG_HOMEHUB_VOICE
+    int network_light=network_feedback_light();
+    easyinput_board_green(network_feedback_ready());
+#else
+    int network_light=0;
     easyinput_board_green(state == LED_STATE_WS_CONNECTED);
+#endif
 #if CONFIG_HOMEHUB_RADIO
     if (atomic_load(&s_radio_dark)) {
         ring_fill((rgb_t){0,0,0});
@@ -1036,7 +1045,7 @@ static bool voice_render(void) {
         return true;
     }
 #endif
-    if (voice == LED_VOICE_IDLE && state != LED_STATE_ERROR && !easyinput_board_muted() &&
+    if (voice == LED_VOICE_IDLE && (state != LED_STATE_ERROR || network_light) && !easyinput_board_muted() &&
         esp_timer_get_time() < brightness_until) {
         rgb_t px[RING_LEDS];
         for (unsigned i = 0; i < RING_LEDS; ++i) px[i] = (rgb_t){32, 20, 8};
@@ -1044,10 +1053,23 @@ static bool voice_render(void) {
         led_wait(VOICE_FRAME_MS);
         return true;
     }
-    if (state == LED_STATE_ERROR || (easyinput_board_muted() && voice != LED_VOICE_ERROR)) {
+    if (easyinput_board_muted() && voice != LED_VOICE_ERROR) {
         ring_fill((rgb_t){24, 0, 0});
         led_wait(VOICE_FRAME_MS);
         return true;
+    }
+#if CONFIG_HOMEHUB_VOICE
+    if (voice==LED_VOICE_IDLE && !show_volume && network_light) {
+        rgb_t px[RING_LEDS]={0};
+        float phase=(esp_timer_get_time()%2400000)/2400000.0f;
+        float level=network_light==3 ? (phase<0.12f ? 1.0f : 0.0f) :
+            0.15f+0.85f*(0.5f-0.5f*cosf(2*(float)M_PI*phase));
+        px[RING_LEDS/2]=scaled(network_light==1 ? (rgb_t){0,0,16} : (rgb_t){16,8,0},level);
+        ring_show(px); led_wait(VOICE_FRAME_MS); return true;
+    }
+#endif
+    if (state==LED_STATE_ERROR && voice==LED_VOICE_IDLE) {
+        ring_fill((rgb_t){24,0,0}); led_wait(VOICE_FRAME_MS); return true;
     }
     show_volume = show_volume && voice != LED_VOICE_ERROR && voice != LED_VOICE_LISTENING
         && voice != LED_VOICE_END_CANDIDATE

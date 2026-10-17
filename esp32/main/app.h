@@ -21,6 +21,10 @@
 #include <stdint.h>
 
 void app_run(void);
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_VOICE
+// 非阻塞请求；主循环串行处理，正在重试时不并发启动。
+void app_network_retry(void);
+#endif
 
 // How joining one of the saved Wi-Fi networks went.
 typedef enum {

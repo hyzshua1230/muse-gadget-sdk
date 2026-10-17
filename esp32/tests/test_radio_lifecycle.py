@@ -28,7 +28,9 @@ class RadioOwnership(unittest.TestCase):
         cls.radio = (ROOT / "main/radio.c").read_text(encoding="utf-8")
 
     def test_failed_radio_pause_releases_claim_without_starting_ai(self):
-        failed = block(self.voice, "if (!radio_pause(true))")
+        # 通知也会申请电台输出锁；此测试只约束原AI语音主流程。
+        task = self.voice[self.voice.index("static void voice_task("):]
+        failed = block(task, "if (!radio_pause(true))")
         self.assertIn("radio_pause(false);", failed)
         self.assertIn("voice_wake_stop()", failed)
         self.assertIn("continue;", failed)
