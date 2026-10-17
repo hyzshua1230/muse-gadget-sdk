@@ -77,6 +77,7 @@ typedef enum {
     LED_VOICE_ERROR,
     LED_VOICE_REPLAY_WAIT,   // EasyInput：两灯暖黄呼吸，等待完整缓存
     LED_VOICE_REPLAY_NOTICE, // EasyInput：暖黄闪烁两次
+    LED_VOICE_END_CANDIDATE, // EasyInput：蓝色呼吸，仍在接收停顿后的语音
 } led_voice_t;
 
 void led_status_set_voice(led_voice_t voice);
@@ -85,6 +86,10 @@ void led_status_set_voice_error(unsigned lights);
 void led_status_replay_notice(unsigned lights);
 // EasyInput：实际进入唤醒监听时柔和提示一次；停止监听时取消。
 void led_status_set_wake_listening(bool listening);
+void led_status_show_brightness(void);
+#if CONFIG_HOMEHUB_RADIO
+void led_status_radio_dark(bool dark);
+#endif
 // Microphone level for LED_VOICE_LISTENING, 0 to 1.
 void led_status_set_level(float level);
 // Show the speaker volume (0 to 100) on the ring for a moment, over whatever

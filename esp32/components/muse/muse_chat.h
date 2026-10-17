@@ -77,6 +77,10 @@ void muse_hatch_set_resting(bool resting);
 
 /* Token set and Wi-Fi up: a press can start a turn. */
 bool muse_hatch_ready(void);
+#if CONFIG_HOMEHUB_RADIO
+// 初始化阶段注册；只处理明确的本地电台命令，不改变普通Muse对话。
+void muse_hatch_set_local_command_handler(bool (*handler)(const char *));
+#endif
 
 /* Press: connects if needed and starts streaming speech to the VM. */
 void muse_hatch_turn_begin(void);

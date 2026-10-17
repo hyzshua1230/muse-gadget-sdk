@@ -17,6 +17,7 @@
 #include "easyinput_board.h"
 #include <stdatomic.h>
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -27,6 +28,7 @@
 #include "freertos/semphr.h"
 
 static atomic_bool s_muted;
+static atomic_int s_brightness = 25;
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_cal;
 static SemaphoreHandle_t s_lock;
@@ -49,6 +51,16 @@ esp_err_t easyinput_board_init(void) {
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), "link.easyinput", "outputs");
     gpio_set_level(GPIO_NUM_5, 0);
     gpio_set_level(GPIO_NUM_42, 0);
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_1, .freq_hz = 5000, .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), "link.easyinput", "green PWM timer");
+    ledc_channel_config_t green = {
+        .gpio_num = 42, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_3, .timer_sel = LEDC_TIMER_1, .duty = 0,
+    };
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&green), "link.easyinput", "green PWM channel");
     cfg.pin_bit_mask = 1ULL << 11;
     cfg.mode = GPIO_MODE_DISABLE;
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), "link.easyinput", "microphone input");
@@ -77,7 +89,16 @@ esp_err_t easyinput_board_init(void) {
     return ESP_OK;
 }
 
-void easyinput_board_green(bool ready) { gpio_set_level(GPIO_NUM_42, ready); }
+void easyinput_board_green(bool ready) {
+    // 工作灯最高使用约1/4占空比；与灯条共同受百分比设置控制。
+    unsigned duty = ready ? (unsigned)atomic_load(&s_brightness) * 256 / 100 : 0;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
+}
+int easyinput_board_brightness(void) { return atomic_load(&s_brightness); }
+void easyinput_board_set_brightness(int percent) {
+    atomic_store(&s_brightness, percent < 1 ? 1 : percent > 100 ? 100 : percent);
+}
 bool easyinput_board_muted(void) { return atomic_load(&s_muted); }
 void easyinput_board_set_muted(bool muted) { atomic_store(&s_muted, muted); }
 

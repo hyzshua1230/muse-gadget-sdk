@@ -77,7 +77,6 @@ extern "C" {
 #include "muse_chat_priv.h"
 #if CONFIG_HOMEHUB_QWEN_ASR
 #include "muse_qwen_asr.h"
-static uint8_t *s_asr_record;
 #endif
 #if CONFIG_HOMEHUB_QWEN_TTS
 #include "muse_qwen_tts.h"
@@ -108,7 +107,12 @@ static const char *TAG = "muse_chat_session";
 #define MP3_BUF (512 * 1024)
 #define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
 #define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
+#if CONFIG_HOMEHUB_QWEN_ASR
+// 覆盖实时ASR连接预算，并留5秒供任务调度及积压音频发送。
+#define IN_BYTES (MIC_RATE * 2 * (MUSE_QWEN_ASR_CONNECT_TIMEOUT_MS / 1000 + 5))
+#else
 #define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
+#endif
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
 #define EV_TEXT 72
 #if CONFIG_HOMEHUB_QWEN_TTS
@@ -1131,8 +1135,6 @@ static void turn_finish(void)
 {
 #if CONFIG_HOMEHUB_QWEN_ASR
     muse_qwen_asr_cancel();
-    free(s_asr_record);
-    s_asr_record = nullptr;
 #endif
 #if CONFIG_HOMEHUB_QWEN_TTS
     muse_qwen_tts_cancel();
@@ -1221,9 +1223,8 @@ static void turn_begin(uint32_t gen)
         return;
     }
 #if CONFIG_HOMEHUB_QWEN_ASR
-    s_asr_record = static_cast<uint8_t *>(psram_alloc(NOTE_MAX_BYTES));
-    if (!s_asr_record) {
-        turn_fail("QWEN ASR NO MEMORY");
+    if (!muse_qwen_asr_begin(gen)) {
+        turn_fail("QWEN ASR START FAILED");
         return;
     }
     s_turn.phase = P_LISTEN;
@@ -1408,6 +1409,11 @@ static void send_chat(const char *text, const char *modality)
     s_turn.phase = P_WAIT_REPLY;
 }
 
+#if CONFIG_HOMEHUB_RADIO
+static bool (*s_local_command)(const char *);
+void muse_hatch_set_local_command_handler(bool (*handler)(const char *)) { s_local_command = handler; }
+#endif
+
 static void post_chat(const char *text)
 {
     if (s_turn.chat_posted) {
@@ -1425,21 +1431,36 @@ static void post_chat(const char *text)
     }
     ESP_LOGI(TAG, "heard: \"%s\"", text);
     emit(MUSE_HATCH_EV_HEARD, text);
+#if CONFIG_HOMEHUB_RADIO
+    if (s_local_command && s_local_command(text)) { turn_done(true); return; }
+#endif
     send_chat(text, "text");
 }
 
 #if CONFIG_HOMEHUB_QWEN_ASR
 static void record_qwen(void)
 {
-    size_t room = NOTE_MAX_BYTES - s_turn.pcm_bytes;
-    if (room) s_turn.pcm_bytes += xStreamBufferReceive(s_in, s_asr_record + s_turn.pcm_bytes, room, 0);
-    if (!s_turn.end_requested && s_turn.pcm_bytes < NOTE_MAX_BYTES) return;
+    int ready = muse_qwen_asr_ready(s_turn.gen);
+    if (ready < 0) { turn_fail("QWEN ASR CONNECTION FAILED"); return; }
+    if (!ready) return;
+    static uint8_t pcm[3200];
+    size_t got = xStreamBufferReceive(s_in, pcm, sizeof(pcm), 0);
+    if (got) {
+        if (!muse_qwen_asr_audio(pcm, got, s_turn.gen)) {
+            turn_fail("QWEN ASR AUDIO SEND FAILED"); return;
+        }
+        s_turn.pcm_bytes += got;
+    }
+    if (!s_turn.end_requested || xStreamBufferBytesAvailable(s_in)) return;
     mark(M_RELEASE);
     if (s_turn.pcm_bytes < MIC_RATE * 2 * 0.3) {
         turn_fail("DIDN'T CATCH THAT");
         return;
     }
     ESP_LOGI(TAG, "Qwen ASR recording: %.2fs", double(s_turn.pcm_bytes) / (MIC_RATE * 2));
+    if (!muse_qwen_asr_finish(s_turn.gen)) {
+        turn_fail("QWEN ASR COMMIT FAILED"); return;
+    }
     s_turn.end_sent_us = now_us();
     s_turn.phase = P_WAIT_ASR;
     mark(M_SENT);
@@ -1450,15 +1471,6 @@ static void poll_qwen_asr(void)
     if (now_us() - s_turn.end_sent_us >= 60000000) {
         turn_fail("QWEN ASR TIMEOUT");
         return;
-    }
-    if (s_asr_record) {
-        // 取消的旧请求仍在退出时，保留新录音等待，不复用其结果。
-        if (muse_qwen_asr_busy()) return;
-        if (!muse_qwen_asr_start(s_asr_record, s_turn.pcm_bytes, s_turn.gen)) {
-            turn_fail("QWEN ASR START FAILED");
-            return;
-        }
-        free(s_asr_record); s_asr_record = nullptr;
     }
     char *text = nullptr;
     int result = muse_qwen_asr_result(s_turn.gen, &text);

@@ -14,6 +14,13 @@
 
 menu "ESP32 Device SDK"
 
+    config HOMEHUB_RADIO
+        bool "EasyInput network MP3 radio"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE && HOMEHUB_QWEN_ASR
+        default n
+        help
+            S6 toggles streaming radio, S7 selects stations; AI retains speaker priority.
+
     config HOMEHUB_OFFLINE_WAKE
         bool "ESP-SR offline wake word (EasyInput)"
         depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE && HOMEHUB_QWEN_ASR

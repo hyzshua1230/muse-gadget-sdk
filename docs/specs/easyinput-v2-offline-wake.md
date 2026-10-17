@@ -5,7 +5,7 @@
 ## 1. 已确认范围
 
 - 使用兼容的内置唤醒词“你好小益”；用户已确认替换最初的“Hi，乐鑫”。固定组件包提供WakeNet模型`wn9_nihaoxiaoyi_tts2`及`vadnet1_medium`，不申请定制模型。
-- 唤醒后自动录音，检测说话结束提交，最长15秒。
+- 唤醒后自动录音，新规格最长60秒，S1按住录音最长120秒。最新结束判断规格为[语音轮次结束判断](easyinput-v2-turn-endpointing.md)：800ms候选、2200ms确认结束；自动录音触及上限不提交半条内容。该修改待编译与用户确认后烧录，当前设备仍运行原800ms提交、15秒上限的非流式版本。
 - 回复播放期间停止唤醒检测，S1仍可手动打断；S2静音时停止监听，解除静音恢复空闲监听。
 - 保留现有S3续播/重播、S4暂停/取消和S8配对/恢复；识别文字与回复仍使用Qwen ASR、Muse、Qwen TTS。
 - 唤醒词识别在设备本地完成。空闲监听音频不上传云端；只有唤醒或按S1触发的有效录音才提交。
@@ -223,6 +223,19 @@ AFE输入采用单麦克风格式`M`，首版关闭AEC和双麦算法，接入Wa
 - 提交代码后，重新枚举COM6确认既有设备USB序列号，执行 `python ./tmp/easyinput/capture-asr.py COM6 300 tmp/easyinput/wake-false-trigger-baseline.log`。请用户保持空闲、未静音，开启日常音量背景声约3分钟，不说唤醒词、不按键，观察蓝色录音灯及自动回复。
 - 用户确认“没有误唤醒”；超过3分钟的采集窗口未记录 `wake detected`，心跳wifi/ws/raw持续up，内部可用RAM约36KiB、最大块18KiB、PSRAM约4961KiB。本轮短时误唤醒观察通过；背景声类型与声压未提供，不推导所有声源或长期零误唤醒，也不补算6.12噪声环境的唤醒成功率。
 - 保留原模型、阈值及采音参数，不改代码、不编译、不烧录。人工停止采集释放串口，日志保留在Workspace，不新增依赖、访问外部域名、修改全局配置或清理文件。本条仅补充验证记录。
+
+### 6.14 旋钮亮度模式与持久化（2026-10-11）
+
+- 用户确认短按切换模式后要求执行。默认旋转仍调音量；GPIO18旋钮短按（松开时、按压不超过1秒）切换亮度模式，再短按或5秒无操作恢复音量模式。亮度每格5个百分点，范围1–100%，首次默认25%；模式本身不保存。
+- 五灯全部状态通过统一输出缩放，保留既有每通道约12级柔和上限，非零通道最低一级，低亮度下受WS2812整数等级限制。GPIO42独立工作灯使用5kHz、10bit LEDC PWM（低速timer1/channel3），最高占空比约25%，与灯条受同一亮度值控制；不控制共享GPIO8电源。两类灯亮度曲线不同，实际视觉一致性待实测。
+- 进入亮度模式和旋转时显示800ms暖白提示，仅空闲且未静音/错误时显示；录音、回复和重播状态保持原提示，整体仍使用新亮度。亮度由旋钮内部RAM任务在停转2秒后以 `led_brightness` 写入既有配置存储，值未变化不写入；启动在首个灯条画面前读取并校验1–100范围，工作灯PWM初始化占空比为0。保存失败记录日志，不声称已持久保存。
+- 修改 `button.c`、`voice.c/.h`、`led_status.c/.h`、`easyinput_board.c/.h`，当前正在既有SDK6.0.1和离线唤醒构建入口编译；日志 `esp32/tmp/easyinput/brightness-mode-build.log`。复用已审查、已授权的本地模型/ESP-DL生成步骤，无新增依赖、外部下载、全局修改或清理；本步不烧录。
+- 现场验收：短按后旋转只调亮度、两类灯均随设置变化、再短按及5秒超时恢复音量；停转至少2秒后重启恢复亮度且无启动闪亮；录音/回复/静音/错误灯效优先级保持，配网和离线唤醒不回归。编译通过不替代这些实体与重启验证。
+- 编译已完成，实际使用既有环境及默认overlay，执行 `python "$env:IDF_PATH/tools/idf.py" -B build-easyinput-v2-wake -D SDKCONFIG=tmp/easyinput/sdkconfig.wake-memory-4k build`，退出码0；应用2101248字节，SHA256 `7ff65564f0f0ed90b74ff8f73dbb3519105a8fd0591acb25b0df5ae283cee40e`，占4MiB应用分区约50%。执行 `python -m unittest tests.test_easyinput_wake_partition tests.test_easyinput_audio_filter`，6项通过，`git diff --check`通过。上述测试未覆盖旋钮模式及NVS重启恢复，现场仍待验证；按用户“用户确认才烧”的要求，尚未烧录。没有新增依赖、外部域名访问、全局修改或清理操作。
+
+- 用户随后要求“烧录验证”。重新枚举并通过esptool核验COM6、ESP32-S3 v0.2及MAC `c4:9e:7e:07:9f:d8`，仅写应用：`python -m esptool --chip esp32s3 --port COM6 -b 460800 --connect-attempts 2 --before default-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size keep 0x20000 build-easyinput-v2-wake/muse-gadget.bin`，退出码0、Hash校验通过，日志 `esp32/tmp/easyinput/brightness-mode-flash.log`；不写分区、NVS、模型或eFuse。
+- 执行 `python ./tmp/easyinput/capture-asr.py COM6 300 tmp/easyinput/brightness-mode-validation.log`。用户确认两类灯调节及模式切换“正常”；日志记录旋钮短按进入brightness模式、`brightness saved: 1`及5秒无操作退出，网络恢复up。用户关机测试期间USB断开、采集因SerialException结束；重新枚举同一设备后执行 `python ./tmp/easyinput/capture-asr.py COM6 180 tmp/easyinput/brightness-mode-restart-validation.log`，不复位或再次写入。
+- 后续日志确认唤醒、ASR/TTS HTTP 200、扬声器输出38400帧并恢复 `listening locally`，模式切换和音量调节仍有记录。此时重启后亮度保持的现场反馈尚待用户确认，不以保存成功日志代替NVS启动恢复验收。本轮没有新增依赖、外部域名访问、全局配置修改或文件清理。
 
 ## 7. 独立构建入口
 

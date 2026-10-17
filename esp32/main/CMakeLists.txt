@@ -68,6 +68,7 @@ set(GADGET_REQUIRES
     esp_driver_i2s
     esp_driver_pcnt
     esp_adc
+    minimp3
 )
 
 # E-paper has its own status screen in place of led_status.c, with
@@ -121,9 +122,16 @@ if(CONFIG_HOMEHUB_OFFLINE_WAKE)
     list(APPEND GADGET_REQUIRES esp-sr)
 endif()
 
+set(RADIO_EMBED)
+if(CONFIG_HOMEHUB_RADIO)
+    list(APPEND GADGET_SRCS "radio.c")
+    list(APPEND RADIO_EMBED "radio_assets/classical.pcm" "radio_assets/ambient.pcm")
+endif()
+
 idf_component_register(
     SRCS ${GADGET_SRCS}
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS "../avatar"
     REQUIRES ${GADGET_REQUIRES}
+    EMBED_FILES ${RADIO_EMBED}
 )

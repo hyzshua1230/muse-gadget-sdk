@@ -38,6 +38,8 @@
 #include "led_strip.h"
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
+#include "config_store.h"
+#include <stdlib.h>
 #endif
 #elif CONFIG_HOMEHUB_DISPLAY
 #include "driver/gpio.h"
@@ -60,6 +62,11 @@
 #endif
 
 static const char *TAG = "link.led";
+#if CONFIG_HOMEHUB_RADIO
+#include <stdatomic.h>
+static atomic_bool s_radio_dark;
+void led_status_radio_dark(bool dark) { atomic_store(&s_radio_dark, dark); }
+#endif
 
 // Muse Home Link RGB LED: 3 channels, driven via LEDC PWM.
 #if CONFIG_HOMEHUB_LED_BACKEND_PWM_RGB
@@ -234,6 +241,7 @@ static unsigned s_error_lights = 5;
 static unsigned s_notice_lights = 1;
 static unsigned s_notice_epoch;
 static int64_t s_wake_ready_until;
+static int64_t s_brightness_until;
 #endif
 #endif
 
@@ -346,13 +354,16 @@ static int s_connected_frames = 0;
 
 static void ring_show(const rgb_t *px) {
     if (!s_strip) return;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    int brightness = easyinput_board_brightness();
+#endif
     for (int i = 0; i < RING_LEDS; i++) {
         if (led_strip_set_pixel(s_strip, i,
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-                // 在原有通道上限基础上统一缩到约1/4，覆盖全部颜色与动画。
-                (px[i].r > 50 ? 50 : px[i].r) / 4,
-                (px[i].g > 50 ? 50 : px[i].g) / 4,
-                (px[i].b > 50 ? 50 : px[i].b) / 4
+                // 百分比控制既有柔和上限，非零通道至少保留一级。
+                px[i].r ? 1 + ((px[i].r > 50 ? 50 : px[i].r) - 1) * brightness / 400 : 0,
+                px[i].g ? 1 + ((px[i].g > 50 ? 50 : px[i].g) - 1) * brightness / 400 : 0,
+                px[i].b ? 1 + ((px[i].b > 50 ? 50 : px[i].b) - 1) * brightness / 400 : 0
 #else
                 px[i].r, px[i].g, px[i].b
 #endif
@@ -1007,6 +1018,7 @@ static bool voice_render(void) {
     unsigned error_lights = s_error_lights;
     unsigned notice_lights = s_notice_lights, notice_epoch = s_notice_epoch;
     int64_t wake_ready_until = s_wake_ready_until;
+    int64_t brightness_until = s_brightness_until;
     static unsigned last_notice_epoch;
     if (notice_epoch != last_notice_epoch) { frame = 0; last_notice_epoch = notice_epoch; }
 #endif
@@ -1017,12 +1029,28 @@ static bool voice_render(void) {
     state = s_state;
     xSemaphoreGive(s_mutex);
     easyinput_board_green(state == LED_STATE_WS_CONNECTED);
+#if CONFIG_HOMEHUB_RADIO
+    if (atomic_load(&s_radio_dark)) {
+        ring_fill((rgb_t){0,0,0});
+        led_wait(VOICE_FRAME_MS);
+        return true;
+    }
+#endif
+    if (voice == LED_VOICE_IDLE && state != LED_STATE_ERROR && !easyinput_board_muted() &&
+        esp_timer_get_time() < brightness_until) {
+        rgb_t px[RING_LEDS];
+        for (unsigned i = 0; i < RING_LEDS; ++i) px[i] = (rgb_t){32, 20, 8};
+        ring_show(px);
+        led_wait(VOICE_FRAME_MS);
+        return true;
+    }
     if (state == LED_STATE_ERROR || (easyinput_board_muted() && voice != LED_VOICE_ERROR)) {
         ring_fill((rgb_t){24, 0, 0});
         led_wait(VOICE_FRAME_MS);
         return true;
     }
     show_volume = show_volume && voice != LED_VOICE_ERROR && voice != LED_VOICE_LISTENING
+        && voice != LED_VOICE_END_CANDIDATE
         && voice != LED_VOICE_REPLAY_WAIT && voice != LED_VOICE_REPLAY_NOTICE;
 #endif
     if (show_volume) {
@@ -1094,6 +1122,12 @@ static bool voice_render(void) {
             break;
         }
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        case LED_VOICE_END_CANDIDATE: {
+            float breath = 0.5f - 0.5f * cosf(2 * (float)M_PI * frame / 40);
+            for (unsigned i = 0; i < RING_LEDS; ++i)
+                px[i] = scaled((rgb_t){0, 0, 32}, 0.25f + 0.75f * breath);
+            break;
+        }
         case LED_VOICE_REPLAY_WAIT: {
             float breath = 0.5f - 0.5f * cosf(2 * (float)M_PI * frame / 50);
             for (unsigned i = 0; i < 2; ++i) px[i] = scaled((rgb_t){48, 24, 0}, 0.2f + 0.8f * breath);
@@ -1195,6 +1229,16 @@ static void led_task(void *arg) {
 }
 
 bool led_status_init(void) {
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    // 配置存储已初始化；在任何启动灯效之前恢复亮度。
+    char value[8];
+    if (config_get_str("led_brightness", value, sizeof(value))) {
+        char *end;
+        long percent = strtol(value, &end, 10);
+        if (end != value && *end == '\0' && percent >= 1 && percent <= 100)
+            easyinput_board_set_brightness((int)percent);
+    }
+#endif
     if (!led_hw_init()) {
         return false;
     }
@@ -1247,6 +1291,15 @@ void led_status_set_voice(led_voice_t voice) {
 }
 
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+void led_status_show_brightness(void) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_volume_until = 0;
+    s_brightness_until = esp_timer_get_time() + 800000;
+    xSemaphoreGive(s_mutex);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
 void led_status_set_wake_listening(bool listening) {
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);

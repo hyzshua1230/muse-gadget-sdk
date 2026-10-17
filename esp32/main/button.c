@@ -22,6 +22,9 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#if CONFIG_HOMEHUB_RADIO
+#include "radio.h"
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "voice.h"
 #endif
@@ -51,7 +54,10 @@ static const int s_keys[9] = {2, 47, 38, 41, 1, 6, 7, 48, 18};
 static void button_task(void *arg) {
     bool stable[9] = {0}, candidate[9] = {0}, fired = false;
     unsigned ticks[9] = {0};
-    int64_t s8_start = 0;
+    int64_t s8_start = 0, dial_start = 0;
+#if CONFIG_HOMEHUB_RADIO
+    int64_t s6_start = 0, s7_start = 0;
+#endif
     for (;;) {
         int64_t now = esp_timer_get_time();
         for (int i = 0; i < 9; ++i) {
@@ -73,6 +79,22 @@ static void button_task(void *arg) {
             else if (i == 1 && pressed) voice_toggle_mute();
             else if (i == 2 && pressed) voice_replay();
             else if (i == 3 && pressed) voice_cancel();
+            else if (i == 8) {
+                if (pressed) dial_start = now;
+                else if (now - dial_start <= SHORT_PRESS_MAX_MS * 1000LL)
+                    voice_toggle_brightness_mode();
+            }
+#endif
+#if CONFIG_HOMEHUB_RADIO
+            else if (i == 5) {
+                if (pressed) s6_start = now;
+                else if (now-s6_start <= SHORT_PRESS_MAX_MS*1000LL) radio_toggle();
+            }
+            else if (i == 6) {
+                if (pressed) s7_start = now;
+                else if (now-s7_start >= 1000000) radio_select_mode();
+                else radio_next();
+            }
 #endif
             else if (i == 7) {
                 if (pressed) { s8_start = now; fired = false; }

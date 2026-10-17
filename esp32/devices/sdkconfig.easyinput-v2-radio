@@ -1,0 +1,2 @@
+# 叠加在离线唤醒配置之后；仅开启新增网络电台。
+CONFIG_HOMEHUB_RADIO=y

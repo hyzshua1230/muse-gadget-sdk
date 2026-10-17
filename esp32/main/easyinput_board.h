@@ -23,6 +23,8 @@ extern "C" {
 /* 引脚依据：easyinput-board-cy 的 pinout 与两页原理图（AI Keyboard V2.1）。 */
 esp_err_t easyinput_board_init(void);
 void easyinput_board_green(bool ready);
+int easyinput_board_brightness(void);
+void easyinput_board_set_brightness(int percent);
 bool easyinput_board_muted(void);
 void easyinput_board_set_muted(bool muted);
 /* 电压未标定时返回 0；外部供电不存在时 charging 不表示充满。 */

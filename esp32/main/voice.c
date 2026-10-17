@@ -40,6 +40,9 @@
 #include "voice_board.h"
 #include "voice_muse_chat.h"
 #include "voice_player.h"
+#if CONFIG_HOMEHUB_RADIO
+#include "radio.h"
+#endif
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
 #include "voice_wake.h"
 #include "esp_bt.h"
@@ -48,6 +51,8 @@ static bool s_auto_record;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
 static atomic_uint s_cancel_epoch;
+static atomic_uint s_brightness_clicks;
+void voice_toggle_brightness_mode(void) { atomic_fetch_add(&s_brightness_clicks, 1); }
 static atomic_uint s_pause_epoch;
 static atomic_bool s_reply_active, s_paused;
 static atomic_bool s_resume_requested;
@@ -102,10 +107,20 @@ static const char *TAG = "link.voice";
 #define VOLUME_SAVE_MS      2000
 #define DIAL_POLL_MS        20
 
+#if CONFIG_HOMEHUB_QWEN_ASR
+#define CAPTURE_MAX_MS      120000
+#else
 #define CAPTURE_MAX_MS      15000
+#endif
 #define CAPTURE_MIN_MS      300
 #define CAPTURE_CHUNK       (VOICE_MIC_RATE / 50)      // 20 ms
 #define CAPTURE_MAX         (VOICE_MIC_RATE * CAPTURE_MAX_MS / 1000)
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+// 候选阶段继续采音；结束门限从最后一段人声起算，不叠加候选时长。
+#define END_CANDIDATE_MS    800
+#define END_SILENCE_MS      2200
+#define AUTO_CAPTURE_MAX_MS 60000
+#endif
 // Keep listening briefly after release so the last word is not clipped.
 #define RELEASE_TAIL_MS     250
 #define REPLY_CHUNK         (VOICE_PLAYER_RATE / 50)   // 20 ms
@@ -166,14 +181,61 @@ static void apply_volume(int volume) {
 // writes NVS.
 static void dial_task(void *arg) {
     int64_t save_at = 0;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    bool brightness_mode = false;
+    int64_t mode_until = 0, brightness_save_at = 0;
+#endif
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DIAL_POLL_MS));
+        int64_t now = esp_timer_get_time();
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        if (atomic_exchange(&s_brightness_clicks, 0) & 1) {
+#if CONFIG_HOMEHUB_RADIO
+            if (radio_select_confirm()) brightness_mode = false;
+            else
+#endif
+            {
+            brightness_mode = !brightness_mode;
+            mode_until = now + 5000000;
+            if (brightness_mode) led_status_show_brightness();
+            ESP_LOGI(TAG, "dial mode: %s", brightness_mode ? "brightness" : "volume");
+            }
+        }
+        if (brightness_mode && now >= mode_until) {
+            brightness_mode = false;
+            ESP_LOGI(TAG, "dial mode: volume (idle timeout)");
+        }
+#endif
         int steps = voice_board_dial_steps();
+#if CONFIG_HOMEHUB_RADIO
+        if (radio_select_steps(steps)) { steps = 0; brightness_mode = false; }
+#endif
         if (steps) {
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+            if (brightness_mode) {
+                int before = easyinput_board_brightness();
+                easyinput_board_set_brightness(before + steps * 5);
+                if (easyinput_board_brightness() != before) brightness_save_at = now + 2000000;
+                mode_until = now + 5000000;
+                led_status_show_brightness();
+            } else
+#endif
+            {
             int volume = atomic_load(&s_volume) + steps * VOLUME_STEP;
             apply_volume(volume < 0 ? 0 : volume > 100 ? 100 : volume);
-            save_at = esp_timer_get_time() + VOLUME_SAVE_MS * 1000LL;
-        } else if (save_at && esp_timer_get_time() >= save_at) {
+            save_at = now + VOLUME_SAVE_MS * 1000LL;
+            }
+        }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+        if (brightness_save_at && now >= brightness_save_at) {
+            brightness_save_at = 0;
+            char value[8];
+            snprintf(value, sizeof(value), "%d", easyinput_board_brightness());
+            if (config_set_str("led_brightness", value)) ESP_LOGI(TAG, "brightness saved: %s", value);
+            else ESP_LOGW(TAG, "brightness could not be stored");
+        }
+#endif
+        if (save_at && now >= save_at) {
             save_at = 0;
             int volume = atomic_load(&s_volume);
             if (store_volume(volume)) ESP_LOGI(TAG, "volume %d", volume);
@@ -206,6 +268,8 @@ static bool pressed_again(TickType_t wait) {
 // limit. Returns the number of samples, 0 if the capture failed.
 static size_t record(void) {
     static int16_t chunk[CAPTURE_CHUNK];
+    const char *end_reason = "sample_limit";
+    size_t max_samples = CAPTURE_MAX;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     s_record_error = NULL;
     int capture_peak = 0;
@@ -215,22 +279,41 @@ static size_t record(void) {
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
     const bool automatic = s_auto_record;
     bool heard_speech = false;
+    bool end_candidate = false;
     size_t silence_samples = 0;
     int64_t speech_deadline = esp_timer_get_time() + 5000000;
-    int64_t capture_deadline = esp_timer_get_time() + CAPTURE_MAX_MS * 1000LL;
+    if (automatic) max_samples = VOICE_MIC_RATE * AUTO_CAPTURE_MAX_MS / 1000;
+    int64_t capture_deadline = esp_timer_get_time() + AUTO_CAPTURE_MAX_MS * 1000LL;
     if (!automatic && voice_board_mic_start() != ESP_OK) return 0;
 #else
     if (voice_board_mic_start() != ESP_OK) return 0;
 #endif
     size_t samples = 0;
     int64_t stop_at = 0;
-    while (samples < CAPTURE_MAX) {
+    while (samples < max_samples) {
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-        if (cancelled()) break;
+        if (cancelled()) { end_reason = "cancelled"; break; }
+#if CONFIG_HOMEHUB_QWEN_ASR
+        // 流式连接/发送失败立即停止，不等缓冲积压后才发现。
+        static char upstream_error[128];
+        muse_hatch_ev_t event;
+        while ((event = muse_hatch_turn_event(upstream_error, sizeof(upstream_error))) != MUSE_HATCH_EV_NONE) {
+            if (event == MUSE_HATCH_EV_ERROR) {
+                s_record_error = upstream_error;
+                end_reason = "upstream_error";
+                break;
+            }
+        }
+        if (s_record_error) break;
+#endif
 #endif
         voice_event_t evt;
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
-        if (automatic && esp_timer_get_time() >= capture_deadline) break;
+        if (automatic && esp_timer_get_time() >= capture_deadline) {
+            end_reason = "time_limit";
+            s_record_error = "RECORDING TIME LIMIT";
+            break;
+        }
         if (automatic && xQueuePeek(s_events, &evt, 0) == pdTRUE && evt.kind == EVT_PRESS &&
             evt.cancel_epoch == atomic_load(&s_cancel_epoch)) {
             // 留在队列中让语音主循环接管，不提交自动录音的半句。
@@ -238,13 +321,14 @@ static size_t record(void) {
             xQueueReceive(s_events, &evt, 0);
             evt.cancel_epoch = takeover_epoch;
             xQueueSendToFront(s_events, &evt, 0);
+            end_reason = "manual_takeover";
             break;
         }
 #endif
         if (!stop_at && xQueueReceive(s_events, &evt, 0) == pdTRUE && evt.kind == EVT_RELEASE) {
             stop_at = esp_timer_get_time() + RELEASE_TAIL_MS * 1000LL;
         }
-        if (stop_at && esp_timer_get_time() >= stop_at) break;
+        if (stop_at && esp_timer_get_time() >= stop_at) { end_reason = "button_release"; break; }
         int peak = 0;
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
         bool speech = false;
@@ -254,13 +338,14 @@ static size_t record(void) {
         size_t got = voice_board_mic_read(chunk, CAPTURE_CHUNK, &peak);
 #endif
         if (!got) {
+            end_reason = "microphone_error";
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
             s_record_error = "MICROPHONE READ FAILED";
 #endif
             break;
         }
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-        if (cancelled()) break;
+        if (cancelled()) { end_reason = "cancelled"; break; }
 #endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
@@ -268,16 +353,27 @@ static size_t record(void) {
             if (!heard_speech && !speech) {
                 if (esp_timer_get_time() >= speech_deadline) {
                     ESP_LOGI(TAG, "wake had no question; not submitted");
+                    end_reason = "no_question";
                     break;
                 }
                 continue;
             }
             heard_speech = heard_speech || speech;
             silence_samples = speech ? 0 : silence_samples + got;
+            if (speech && end_candidate) {
+                end_candidate = false;
+                led_status_set_voice(LED_VOICE_LISTENING);
+                ESP_LOGI(TAG, "recording continued after pause");
+            } else if (!end_candidate && silence_samples >= VOICE_MIC_RATE * END_CANDIDATE_MS / 1000) {
+                end_candidate = true;
+                led_status_set_voice(LED_VOICE_END_CANDIDATE);
+                ESP_LOGI(TAG, "recording end candidate; still listening");
+            }
         }
 #endif
         if (muse_hatch_turn_audio_wait(chunk, got, 100) != got) {
             s_record_error = "MICROPHONE BACKLOG FULL";
+            end_reason = "backlog_full";
             break;
         }
         if (peak > capture_peak) capture_peak = peak;
@@ -292,9 +388,15 @@ static size_t record(void) {
         samples += got;
         led_status_set_level(peak / 12000.0f);
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
-        if (automatic && silence_samples >= VOICE_MIC_RATE * 800 / 1000) break;
+        if (automatic && silence_samples >= VOICE_MIC_RATE * END_SILENCE_MS / 1000) {
+            end_reason = "silence_end";
+            break;
+        }
 #endif
     }
+#if CONFIG_HOMEHUB_QWEN_ASR && CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+    if (samples >= max_samples) s_record_error = "RECORDING TIME LIMIT";
+#endif
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
     if (automatic) {
         if (voice_wake_stop() != ESP_OK) s_record_error = "MICROPHONE STOP FAILED";
@@ -302,12 +404,13 @@ static size_t record(void) {
 #else
     voice_board_mic_stop();
 #endif
+    ESP_LOGI(TAG, "recording end: reason=%s samples=%u", end_reason, (unsigned)samples);
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     ESP_LOGI(TAG, "mic samples=%u peak=%d mean_square=%llu clipped=%u", (unsigned)samples,
              capture_peak, (unsigned long long)(samples ? energy / samples : 0), (unsigned)clipped);
     if (s_record_error) return 0; // 不提交已经缺失音频的半句录音。
 #endif
-    if (samples >= CAPTURE_MAX) ESP_LOGI(TAG, "capture limit reached");
+    if (samples >= max_samples) ESP_LOGI(TAG, "capture limit reached");
     return samples;
 }
 
@@ -321,7 +424,8 @@ static bool fail(const char *why) {
     s_resume_at = 0;
 #endif
     unsigned lights = strstr(why, "TTS") ? 2 : strstr(why, "SPEAKER") ? 3 :
-        strstr(why, "ASR") || strstr(why, "MICROPHONE") || strstr(why, "CATCH") ? 1 : 5;
+        strstr(why, "ASR") || strstr(why, "MICROPHONE") || strstr(why, "CATCH") ||
+        strstr(why, "RECORDING") ? 1 : 5;
     led_status_set_voice_error(lights);
 #else
     led_status_set_voice(LED_VOICE_ERROR);
@@ -682,14 +786,32 @@ static void voice_task(void *arg) {
         ESP_LOGW(TAG, "no memory for the dial");
     }
     ESP_LOGI(TAG, "ready");
+#if CONFIG_HOMEHUB_RADIO
+    if (radio_init() != ESP_OK) ESP_LOGE(TAG,"radio initialization failed");
+    bool radio_release_pending = false;
+#endif
 
     for (;;) {
+#if CONFIG_HOMEHUB_RADIO
+        // 超时只延后交还；确认旧播放器退出前，不接管录音或恢复电台。
+        if (radio_release_pending) {
+            if (!voice_player_wait(0)) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            radio_pause(false);
+            radio_release_pending = false;
+        }
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
         voice_event_t evt;
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
         s_auto_record = false;
         if (xQueueReceive(s_events, &evt, 0) != pdTRUE) {
             if (easyinput_board_muted() || atomic_load(&s_paused) ||
+#if CONFIG_HOMEHUB_RADIO
+                radio_enabled() ||
+#endif
                 atomic_load(&s_busy) || !muse_hatch_ready() ||
                 esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE) {
                 if (voice_wake_stop() != ESP_OK) {
@@ -718,6 +840,9 @@ static void voice_task(void *arg) {
             if (!voice_wake_poll()) continue;
             bool idle = false;
             if (easyinput_board_muted() || !muse_hatch_ready() ||
+#if CONFIG_HOMEHUB_RADIO
+                radio_enabled() ||
+#endif
                 !atomic_compare_exchange_strong(&s_busy, &idle, true)) {
                 voice_wake_stop();
                 continue;
@@ -744,6 +869,21 @@ static void voice_task(void *arg) {
             continue;
         }
         s_turn_epoch = evt.cancel_epoch;
+#if CONFIG_HOMEHUB_RADIO
+        if (!radio_pause(true)) {
+            fail("RADIO STOP TIMEOUT");
+            // 尚未启动AI播放器，可直接撤销本次暂停请求。
+            radio_pause(false);
+#if CONFIG_HOMEHUB_OFFLINE_WAKE
+            if (voice_wake_stop() != ESP_OK) {
+                fail("MICROPHONE STOP FAILED");
+                vTaskSuspend(NULL);
+            }
+#endif
+            atomic_store(&s_busy,false);
+            continue;
+        }
+#endif
         bool talk = evt.kind == EVT_PRESS;
 #if CONFIG_HOMEHUB_QWEN_TTS
         if (evt.kind == EVT_REPLAY) talk = replay();
@@ -758,6 +898,14 @@ static void voice_task(void *arg) {
 #endif
         atomic_store(&s_reply_active, false);
         atomic_store(&s_busy, false);
+#if CONFIG_HOMEHUB_RADIO
+        // 取消路径的播放器仍可能排空DMA；完成后才交还喇叭。
+        if (voice_player_wait(1000)) radio_pause(false);
+        else {
+            radio_release_pending = true;
+            fail("SPEAKER STOP TIMEOUT");
+        }
+#endif
 #if CONFIG_HOMEHUB_QWEN_TTS
         if (atomic_exchange(&s_resume_requested, false) && atomic_load(&s_paused) && !easyinput_board_muted())
             voice_replay();
@@ -771,6 +919,9 @@ static void voice_task(void *arg) {
 }
 
 void voice_init(void) {
+#if CONFIG_HOMEHUB_RADIO
+    muse_hatch_set_local_command_handler(radio_voice_command);
+#endif
     s_events = xQueueCreate(8, sizeof(voice_event_t));
     if (!s_events) {
         ESP_LOGE(TAG, "no memory for voice chat");
