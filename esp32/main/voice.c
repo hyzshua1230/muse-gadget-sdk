@@ -811,7 +811,7 @@ static bool play_network_notice(network_notice_t notice) {
             float envelope=1;
             if (pos<320) envelope=(float)pos/320;
             if (samples-pos<320) envelope=(float)(samples-pos)/320;
-            if (start) chunk[i]=(int16_t)(((const int16_t *)start)[pos]*envelope/5);
+            if (start) chunk[i]=(int16_t)(((const int16_t *)start)[pos]*envelope/2);
             else {
                 // 失败双音；恢复单个上行双音，总长不足半秒，包络防爆音。
                 size_t p=pos%(VOICE_PLAYER_RATE/4);
