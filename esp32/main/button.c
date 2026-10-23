@@ -29,6 +29,9 @@
 #include "voice.h"
 #include "network_feedback.h"
 #endif
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+#include "easyinput_oled.h"
+#endif
 
 
 static const char *TAG = "link.button";
@@ -69,6 +72,9 @@ static void button_task(void *arg) {
             stable[i] = pressed;
             ESP_LOGI(TAG, "input %s%d %s", i < 8 ? "S" : "encoder", i < 8 ? i+1 : 1,
                      pressed ? "down" : "up");
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+            if (pressed) easyinput_oled_headpat();
+#endif
             if (i == 0) {
                 /* S1 永远只属于语音，未认领时也不能变成配对或恢复键。 */
 #if CONFIG_HOMEHUB_VOICE

@@ -55,6 +55,9 @@ static bool s_auto_record;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
 #include "network_feedback.h"
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+#include "easyinput_oled.h"
+#endif
 static atomic_uint s_cancel_epoch;
 static atomic_uint s_brightness_clicks;
 void voice_toggle_brightness_mode(void) { atomic_fetch_add(&s_brightness_clicks, 1); }
@@ -283,6 +286,9 @@ static void dial_task(void *arg) {
         if (radio_select_steps(steps)) { steps = 0; brightness_mode = false; }
 #endif
         if (steps) {
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+            easyinput_oled_headpat();
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
             if (brightness_mode) {
                 int before = easyinput_board_brightness();
