@@ -242,6 +242,20 @@ static char s_title[48];
 static bool s_title_dirty = false;
 #if CONFIG_HOMEHUB_VOICE
 static led_voice_t s_voice = LED_VOICE_IDLE;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+void led_status_oled_snapshot(led_voice_t *voice, bool *radio_dark) {
+    *voice = LED_VOICE_IDLE;
+    if (s_mutex) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        *voice = s_voice;
+        xSemaphoreGive(s_mutex);
+    }
+    *radio_dark = false;
+#if CONFIG_HOMEHUB_RADIO
+    *radio_dark = atomic_load(&s_radio_dark);
+#endif
+}
+#endif
 static float s_level = 0;
 static int s_volume = 0;
 static int64_t s_volume_until = 0;

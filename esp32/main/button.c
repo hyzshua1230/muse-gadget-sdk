@@ -82,7 +82,10 @@ static void button_task(void *arg) {
             else if (i == 3 && pressed) voice_cancel();
             else if (i == 4) {
                 if (pressed) s5_start=now;
-                else if (now-s5_start<=SHORT_PRESS_MAX_MS*1000LL) network_feedback_request();
+                else if (now-s5_start >= 1000000) network_feedback_request();
+#if CONFIG_HOMEHUB_QWEN_TTS && !CONFIG_MUSE_ENABLED
+                else voice_briefing();
+#endif
             }
             else if (i == 8) {
                 if (pressed) dial_start = now;
@@ -93,7 +96,7 @@ static void button_task(void *arg) {
 #if CONFIG_HOMEHUB_RADIO
             else if (i == 5) {
                 if (pressed) s6_start = now;
-                else if (now-s6_start <= SHORT_PRESS_MAX_MS*1000LL) radio_toggle();
+                else if (now-s6_start < SHORT_PRESS_MAX_MS*1000LL) radio_toggle();
             }
             else if (i == 6) {
                 if (pressed) s7_start = now;
@@ -213,7 +216,7 @@ bool button_init(button_cb on_short_press, button_cb on_double_press,
 
     if (xTaskCreate(button_task, "btn", 4096, NULL, 2, NULL) != pdPASS) return false;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-    ESP_LOGI(TAG, "inputs ready: S1=talk S2=mute S3=resume/replay S4=pause/cancel S5=network status/retry S8=pair/reset(5s)");
+    ESP_LOGI(TAG, "inputs ready: S1=talk S2=mute S3=resume/replay S4=pause/cancel S5=briefing/hold network status S8=pair/reset(5s)");
 #else
     ESP_LOGI(TAG, "button ready (GPIO %d: tap=retry wifi, 2x=rescan, hold %ds=reset setup)",
              BTN_GPIO, LONG_PRESS_MS / 1000);

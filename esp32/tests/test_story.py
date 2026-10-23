@@ -48,7 +48,7 @@ class StoryTest(unittest.TestCase):
         self.assertIn('send_chat(cmd.text,"text")', command)
         self.assertIn('free(cmd.text)', command)
         self.assertNotIn('turn_begin(', command)
-        api = block(self.session, 'extern "C" bool muse_hatch_prompt_turn(')
+        api = block(self.session, 'static bool prompt_turn(')
         self.assertIn('strdup(text)', api)
         self.assertIn('free(copy)', api)
 

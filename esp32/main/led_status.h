@@ -79,6 +79,10 @@ typedef enum {
     LED_VOICE_REPLAY_NOTICE, // EasyInput：暖黄闪烁两次
     LED_VOICE_END_CANDIDATE, // EasyInput：蓝色呼吸，仍在接收停顿后的语音
 } led_voice_t;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+// 只读取已发布状态；OLED任务不持有LED锁执行I2C。
+void led_status_oled_snapshot(led_voice_t *voice, bool *radio_dark);
+#endif
 
 void led_status_set_voice(led_voice_t voice);
 // EasyInput：1灯为识别/录音，2灯为合成，3灯为播放，5灯为其他错误。

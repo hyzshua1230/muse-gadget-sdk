@@ -80,6 +80,7 @@ extern "C" {
 #endif
 #if CONFIG_HOMEHUB_QWEN_TTS
 #include "muse_qwen_tts.h"
+#include "muse_briefing_text.h"
 static int16_t *s_qwen_pcm;
 static size_t s_qwen_frames, s_qwen_position;
 static bool s_qwen_requested;
@@ -153,7 +154,7 @@ static const char *TAG = "muse_chat_session";
 
 enum cmd_type_t : uint8_t { CMD_CONNECT, CMD_FORGET, CMD_BEGIN, CMD_END, CMD_CANCEL, CMD_TEXT, CMD_TEXT_CANCEL, CMD_WAKE,
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
-    CMD_PROMPT,
+    CMD_PROMPT, CMD_BRIEFING,
 #endif
 };
 
@@ -241,6 +242,9 @@ struct turn_t {
     phase_t phase;
     uint32_t gen;
     bool text;               /* typed at the console: the reply goes there, unspoken */
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && !CONFIG_MUSE_ENABLED
+    bool briefing, briefing_validated;
+#endif
     bool end_requested, end_sent, chat_posted, acked;
     int64_t dict_id, chat_id;
     int64_t start_us, end_sent_us, chat_us, last_event_us, last_content_us;
@@ -1661,9 +1665,34 @@ static void message_done(int i, const char *final_text)
         ESP_LOGI(TAG, "message %s done (%u chars)", m.id, (unsigned)n);
         return;
     }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && !CONFIG_MUSE_ENABLED
+    if (s_turn.briefing && final_text && final_text[0] && s_turn.texts) {
+        // 以完整最终消息核验，避免流式分块遗漏协议标记或来源。
+        m.len = 0;
+        s_turn.texts[i * TEXT_MAX] = 0;
+    }
+#endif
     if (!m.len && final_text && final_text[0]) {
         if (!append_text(m, final_text)) return;
     }
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && !CONFIG_MUSE_ENABLED
+    if (s_turn.briefing) {
+        const char *reason = s_turn.briefing_validated ? "already_accepted" : "text_buffer_missing";
+        if (s_turn.briefing_validated || !s_turn.texts ||
+            !muse_briefing_speech(s_turn.texts + i * TEXT_MAX, &reason)) {
+            m.tts = TTS_FINISHED; // 进度消息或缺来源的回答不进入TTS。
+            ESP_LOGI(TAG, "briefing message skipped: reason=%s", reason);
+            return;
+        }
+        s_turn.briefing_validated = true;
+        m.len = strlen(s_turn.texts + i * TEXT_MAX);
+        size_t characters = 0;
+        for (size_t pos = 0; pos < m.len; ++pos)
+            characters += (uint8_t(s_turn.texts[i * TEXT_MAX + pos]) & 0xc0) != 0x80;
+        ESP_LOGI(TAG, "briefing speech format accepted: %u characters, %u UTF-8 bytes",
+                 unsigned(characters), unsigned(m.len));
+    }
+#endif
     if (m.len && m.tts == TTS_NONE) {
         m.tts = TTS_QUEUED;
     }
@@ -2079,6 +2108,12 @@ static void check_turn(void)
     }
     ESP_LOGI(TAG, "turn done: %d message(s) in %.1fs", s_turn.nmsgs, (t - s_turn.start_us) / 1e6);
     log_marks();
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && !CONFIG_MUSE_ENABLED
+    if (s_turn.briefing && !s_turn.briefing_validated) {
+        turn_fail("BRIEFING DATE/SOURCES UNAVAILABLE");
+        return;
+    }
+#endif
     turn_done(true);
 }
 
@@ -2304,8 +2339,10 @@ static void handle(const cmd_t &cmd)
         break;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
     case CMD_PROMPT:
+    case CMD_BRIEFING:
         if (cmd.gen == s_gen.load() && turn_start(cmd.gen, false)) {
-            // 连接期间也可能被取消，发送前再次核对，避免提交过期故事。
+            s_turn.briefing = cmd.type == CMD_BRIEFING;
+            // 连接期间也可能被取消，发送前再次核对，避免提交过期文字请求。
             if (cmd.gen == s_gen.load()) {
                 // 使用可朗读轮次，只跳过采音与ASR；原串口文字轮次仍不朗读。
                 ESP_LOGI(TAG,"spoken prompt turn: %u bytes",(unsigned)strlen(cmd.text));
@@ -2514,7 +2551,7 @@ extern "C" void muse_hatch_turn_begin(void)
 }
 
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 && CONFIG_HOMEHUB_QWEN_TTS && CONFIG_HOMEHUB_VOICE && !CONFIG_MUSE_ENABLED
-extern "C" bool muse_hatch_prompt_turn(const char *text)
+static bool prompt_turn(const char *text, cmd_type_t type)
 {
     if (!text || !*text || !muse_hatch_ready()) return false;
     char *copy=strdup(text);
@@ -2522,13 +2559,16 @@ extern "C" bool muse_hatch_prompt_turn(const char *text)
     uint32_t gen=++s_gen;
     xStreamBufferReset(s_in);
     drain_out();
-    cmd_t cmd{CMD_PROMPT,gen,copy};
+    cmd_t cmd{type,gen,copy};
     if (xQueueSend(s_cmds,&cmd,pdMS_TO_TICKS(100))!=pdTRUE) {
         free(copy);
         return false;
     }
     return true;
 }
+
+extern "C" bool muse_hatch_prompt_turn(const char *text) { return prompt_turn(text, CMD_PROMPT); }
+extern "C" bool muse_briefing_turn(const char *text) { return prompt_turn(text, CMD_BRIEFING); }
 #endif
 
 extern "C" void muse_hatch_turn_audio(const int16_t *pcm, size_t frames)

@@ -1,5 +1,6 @@
 #include "muse_qwen_tts.h"
 #include "muse_chat.h"
+#include "muse_qwen_error.h"
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
@@ -9,6 +10,9 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_tls_errors.h"
+#include <cerrno>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -63,71 +67,118 @@ static bool append_wav(uint8_t *wav, size_t bytes) {
     return false;
 }
 
+static esp_err_t transport_event(esp_http_client_event_t *event) {
+    // TLS连接保留10秒预算；建立连接后，每次读写最多等待250ms。
+    if (event->event_id == HTTP_EVENT_ON_CONNECTED)
+        esp_http_client_set_timeout_ms(event->client, 250);
+    return ESP_OK;
+}
+
 static uint8_t *fetch(const char *url, const char *body, size_t limit, uint32_t gen, size_t *length, const char *stage) {
     esp_http_client_config_t cfg = {};
     cfg.url = url;
-    // 合成允许服务端排队至90秒；音频下载保持10秒上限。
-    cfg.timeout_ms = body ? 90000 : 10000;
+    cfg.is_async = true;
+    cfg.timeout_ms = 10000;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.disable_auto_redirect = true;
+    cfg.max_authorization_retries = -1;
+    cfg.event_handler = transport_event;
     auto client = esp_http_client_init(&cfg);
     if (!client) return nullptr;
     ESP_LOGI("qwen_tts", "%s begin", stage);
-    bool ok = true;
+    bool ok = true, timed_out = false, buffer_error = false;
+    esp_err_t result = ESP_OK;
+    int64_t started = esp_timer_get_time(), progress = started;
+    auto active = [&]() {
+        if (!current(gen)) return false;
+        int64_t now = esp_timer_get_time();
+        timed_out = body ? now - started >= 90000000 : now - progress >= 10000000;
+        return !timed_out;
+    };
     if (body) {
         esp_http_client_set_method(client, HTTP_METHOD_POST);
         esp_http_client_set_header(client, "Content-Type", "application/json");
         char auth[256];
         int n = snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_HOMEHUB_QWEN_API_KEY);
         ok = n > 0 && n < int(sizeof(auth));
-        if (ok) esp_http_client_set_header(client, "Authorization", auth);
+        if (ok) ok = esp_http_client_set_header(client, "Authorization", auth) == ESP_OK;
+        memset(auth, 0, sizeof(auth));
     }
     size_t body_size = body ? strlen(body) : 0;
-    ok = ok && current(gen) && esp_http_client_open(client, body_size) == ESP_OK;
-    if (ok && body) ok = esp_http_client_write(client, body, body_size) == int(body_size);
+    // 只继续尚未完成的连接/传输，不重发请求，不增加付费重试。
+    if (ok) {
+        do {
+            if (!active()) { ok = false; break; }
+            result = esp_http_client_open(client, body_size);
+            if (result == ESP_ERR_HTTP_EAGAIN) vTaskDelay(pdMS_TO_TICKS(20));
+        } while (result == ESP_ERR_HTTP_EAGAIN);
+        ok = ok && result == ESP_OK;
+    }
+    size_t sent = 0;
+    while (ok && sent < body_size && active()) {
+        errno = 0;
+        int n = esp_http_client_write(client, body + sent, body_size - sent);
+        if (n > 0) sent += n;
+        else if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) vTaskDelay(pdMS_TO_TICKS(20));
+        else ok = false;
+    }
     int64_t content_bytes = -1;
-    if (ok) {
+    while (ok && active()) {
         content_bytes = esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        ESP_LOGI("qwen_tts", "%s HTTP status %d", stage, status);
-        ok = status == 200;
-        if (content_bytes > int64_t(limit)) ok = false;
+        if (content_bytes >= 0) break;
+        if (content_bytes == -ESP_ERR_HTTP_EAGAIN || errno == EAGAIN || errno == EWOULDBLOCK)
+            vTaskDelay(pdMS_TO_TICKS(20));
+        else { ok = false; break; }
     }
+    int status = esp_http_client_get_status_code(client);
+    // 错误正文只在内存中提取固定错误类别，最多接收4KiB，不打印正文。
+    if (status != 200 && limit > 4096) limit = 4096;
+    if (content_bytes > int64_t(limit)) { ok = false; buffer_error = true; }
     uint8_t *data = nullptr;
-    size_t used = 0, cap = limit < 16384 ? limit : 16384;
-    if (content_bytes > 0 && content_bytes <= int64_t(limit)) cap = size_t(content_bytes);
-    if (ok) {
-#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-        muse_hatch_replay_make_room(cap + 1);
-#endif
-        data = static_cast<uint8_t *>(heap_caps_malloc(cap + 1, MALLOC_CAP_SPIRAM));
-    }
-    ok = ok && data;
-    while (ok && current(gen)) {
-        if (used == cap) {
-            if (cap == limit || content_bytes > 0) { ok = esp_http_client_is_complete_data_received(client); break; }
-            // 分块传输没有Content-Length时按小步增长，避免向上翻倍至4MiB。
-            size_t next_cap = cap + 256 * 1024 < limit ? cap + 256 * 1024 : limit;
-#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-            muse_hatch_replay_make_room(next_cap + 1);
-#endif
-            auto next = static_cast<uint8_t *>(heap_caps_realloc(data, next_cap + 1, MALLOC_CAP_SPIRAM));
-            if (!next) { ok = false; break; }
-            data = next; cap = next_cap;
-        }
-        int n = esp_http_client_read(client, reinterpret_cast<char *>(data + used), cap - used);
+    size_t used = 0, capacity = 0;
+    char chunk[1024];
+    while (ok && active()) {
+        int n = esp_http_client_read(client, chunk, sizeof(chunk));
+        if (n == -ESP_ERR_HTTP_EAGAIN) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         if (n < 0) { ok = false; break; }
         if (!n) { ok = esp_http_client_is_complete_data_received(client); break; }
+        if (size_t(n) > limit - used) { ok = false; buffer_error = true; break; }
+        if (used + size_t(n) > capacity) {
+            size_t next_capacity = used + size_t(n) + 16384;
+            if (next_capacity > limit) next_capacity = limit;
+#if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
+            muse_hatch_replay_make_room(next_capacity + 1);
+#endif
+            auto *next = static_cast<uint8_t *>(heap_caps_realloc(data, next_capacity + 1, MALLOC_CAP_SPIRAM));
+            if (!next) { ok = false; buffer_error = true; break; }
+            data = next;
+            capacity = next_capacity;
+        }
+        memcpy(data + used, chunk, n);
         used += n;
+        progress = esp_timer_get_time();
     }
-    esp_http_client_close(client);
+    esp_err_t tls = esp_http_client_get_and_clear_last_tls_error(client, nullptr, nullptr);
+    int network_error = esp_http_client_get_errno(client);
+    ok = ok && current(gen) && !timed_out && status == 200 && data && used;
+    if (data) data[used] = 0;
+    if (!ok) {
+        const char *category = "transport";
+        if (!current(gen)) category = "cancelled";
+        else if (tls == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME) category = "dns";
+        else if (timed_out || result == ESP_ERR_HTTP_READ_TIMEOUT || network_error == ETIMEDOUT ||
+                 tls == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT) category = "timeout";
+        else if (status >= 400) {
+            auto *error = data ? cJSON_Parse(reinterpret_cast<char *>(data)) : nullptr;
+            const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(error, "code"));
+            category = muse_qwen_service_error(status, code);
+            cJSON_Delete(error);
+        } else if (buffer_error) category = "buffer_limit";
+        ESP_LOGW("qwen_tts", "%s failed: category=%s http=%d bytes=%u", stage, category, status, unsigned(used));
+    } else ESP_LOGI("qwen_tts", "%s complete (%u bytes)", stage, unsigned(used));
+    // 句柄与接收缓冲区由本任务独占；取消只改变generation，不跨任务close。
     esp_http_client_cleanup(client);
-    if (!ok || !current(gen)) {
-        ESP_LOGW("qwen_tts", "%s %s (%u bytes)", stage, current(gen) ? "failed" : "cancelled", (unsigned)used);
-        free(data); return nullptr;
-    }
-    ESP_LOGI("qwen_tts", "%s complete (%u bytes)", stage, (unsigned)used);
-    data[used] = 0;
+    if (!ok) { free(data); return nullptr; }
     *length = used;
     return data;
 }
@@ -203,6 +254,7 @@ static void worker(void *arg) {
 }
 
 bool muse_qwen_tts_start(const char *text, uint32_t generation) {
+    if (!text || !*text || !generation) return false;
     if (s_status.load() != 1 && s_generation.load() == 0) muse_qwen_tts_cancel();
     if (s_status.load() != 0) return false;
     auto req = static_cast<request_t *>(calloc(1, sizeof(request_t)));

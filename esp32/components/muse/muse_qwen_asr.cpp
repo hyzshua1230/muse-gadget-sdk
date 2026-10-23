@@ -1,5 +1,6 @@
 #include "muse_qwen_asr.h"
 #include "muse_chat_priv.h"
+#include "muse_qwen_error.h"
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_tls_errors.h"
+#include <cerrno>
 
 // 生命周期与发送仅由hatch任务调用；回调只接收并发布状态。
 static std::atomic<uint32_t> s_generation{0};
@@ -49,7 +52,9 @@ static void receive_event(const char *json) {
     } else if (!strcmp(type, "error") ||
                !strcmp(type, "conversation.item.input_audio_transcription.failed")) {
         // 不打印服务端正文，避免凭据或用户音频内容进入错误日志。
-        ESP_LOGW("qwen_asr", "realtime service rejected request");
+        auto *error = cJSON_GetObjectItem(root, "error");
+        const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(error, "code"));
+        ESP_LOGW("qwen_asr", "realtime service rejected request: category=%s", muse_qwen_service_error(0, code));
         s_status.store(-1);
     }
     cJSON_Delete(root);
@@ -60,6 +65,13 @@ static void websocket_event(void *arg, esp_event_base_t, int32_t event, void *pa
     if (!gen || s_generation.load() != gen || s_status.load() == -1 || s_status.load() == 4) return;
     auto data = static_cast<esp_websocket_event_data_t *>(payload);
     if (event == WEBSOCKET_EVENT_ERROR || event == WEBSOCKET_EVENT_DISCONNECTED) {
+        if (event == WEBSOCKET_EVENT_ERROR && data) {
+            const auto &err = data->error_handle;
+            const char *category = err.esp_tls_last_esp_err == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME ? "dns" :
+                err.esp_tls_last_esp_err == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT || err.esp_transport_sock_errno == ETIMEDOUT ? "timeout" :
+                err.esp_ws_handshake_status_code >= 400 ? muse_qwen_service_error(err.esp_ws_handshake_status_code, nullptr) : "transport";
+            ESP_LOGW("qwen_asr", "realtime connection failed: category=%s", category);
+        }
         if (s_status.load() != 4) s_status.store(-1);
     } else if (event == WEBSOCKET_EVENT_DATA && (data->op_code == 1 || data->op_code == 0)) {
         // 同时处理WebSocket消息分片和组件缓冲区分块，不截断长转写。
@@ -128,7 +140,10 @@ bool muse_qwen_asr_begin(uint32_t gen) {
 int muse_qwen_asr_ready(uint32_t gen) {
     if (s_generation.load() != gen || s_status.load() < 0) return -1;
     if (s_status.load() == 2) return 1;
-    if (esp_timer_get_time() >= s_connect_deadline) { s_status.store(-1); return -1; }
+    if (esp_timer_get_time() >= s_connect_deadline) {
+        ESP_LOGW("qwen_asr", "realtime connection failed: category=timeout");
+        s_status.store(-1); return -1;
+    }
     if (s_created.load() && !s_update_sent) {
         s_update_sent = true;
         const char *update = "{\"event_id\":\"config\",\"type\":\"session.update\",\"session\":{\"input_audio_format\":\"pcm\",\"sample_rate\":16000,\"input_audio_transcription\":{\"language\":\"zh\"},\"turn_detection\":null}}";
