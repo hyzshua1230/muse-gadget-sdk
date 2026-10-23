@@ -39,6 +39,17 @@ int main(void) {
     assert(!memcmp(frame, pixel_font['?'-PIXEL_FONT_FIRST], 5));
     oled_text_line(frame, 1, "A");
     assert(!memcmp(frame+128, pixel_font['A'-PIXEL_FONT_FIRST], 5));
+    // Test oled_text_at
+    oled_text_at(frame, 2, 36, "OK");
+    assert(!memcmp(frame + 2 * 128 + 36, pixel_font['O'-PIXEL_FONT_FIRST], 5));
+    // Test oled_draw_icon32 boundaries
+    unsigned char icon[128];
+    memset(icon, 0x55, sizeof(icon));
+    oled_draw_icon32(frame, 0, 2, icon);
+    assert(frame[0 * 128 + 2] == 0x55);
+    assert(frame[3 * 128 + 2 + 31] == 0x55);
+    // Out of bounds page should be no-op
+    oled_draw_icon32(frame, 5, 0, icon);
     return 0;
 }
 ''', encoding='utf-8')
