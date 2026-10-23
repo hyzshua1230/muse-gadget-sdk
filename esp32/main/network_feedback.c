@@ -51,6 +51,9 @@ network_notice_t network_feedback_take(void) {
     return notice;
 }
 bool network_feedback_ready(void) { return atomic_load(&s_state)==NET_READY; }
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+network_state_t network_feedback_state(void) { return atomic_load(&s_state); }
+#endif
 bool network_feedback_notice_valid(network_notice_t notice) {
     int state=atomic_load(&s_state);
     switch (notice) {

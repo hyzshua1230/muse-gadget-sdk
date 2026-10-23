@@ -17,6 +17,9 @@
 #include "app.h"
 #include "esp_log.h"
 #include "diagnostic_log.h"
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+#include "easyinput_oled.h"
+#endif
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
 #endif
@@ -27,6 +30,9 @@
 void app_main(void) {
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
     ESP_ERROR_CHECK(easyinput_board_init());
+#endif
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+    easyinput_oled_init();
 #endif
 #if CONFIG_HOMEHUB_SUPPORT_BUG_REPORT
     if (!diagnostic_log_init()) {

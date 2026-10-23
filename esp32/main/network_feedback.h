@@ -12,4 +12,7 @@ void network_feedback_request(void);
 network_notice_t network_feedback_take(void);
 int network_feedback_light(void); // 0不覆盖、1蓝呼吸、2黄呼吸、3黄间歇。
 bool network_feedback_ready(void);
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+network_state_t network_feedback_state(void);
+#endif
 bool network_feedback_notice_valid(network_notice_t notice);

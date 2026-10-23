@@ -14,6 +14,15 @@
 
 menu "ESP32 Device SDK"
 
+    config HOMEHUB_EASYINPUT_OLED
+        bool "EasyInput J4 SSD1315 128x64 status OLED"
+        depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE && !MUSE_ENABLED
+        default n
+        help
+            J4: 3V3, SCL=GPIO44, SDA=GPIO43, GND. Requires USB Serial/JTAG
+            console without secondary UART. Displays status using the existing
+            ASCII font. Radio dark mode also switches off the OLED.
+
     config HOMEHUB_RADIO
         bool "EasyInput network MP3 radio"
         depends on HOMEHUB_LED_BACKEND_EASYINPUT_V2 && HOMEHUB_VOICE && HOMEHUB_QWEN_ASR
