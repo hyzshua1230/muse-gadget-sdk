@@ -167,8 +167,11 @@ static atomic_int s_volume;
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 static atomic_bool s_busy;
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
+static atomic_int s_dial_mode;
+voice_dial_mode_t voice_dial_mode(void) { return atomic_load(&s_dial_mode); }
 int voice_volume(void) { return atomic_load(&s_volume); }
 bool voice_playback_paused(void) { return atomic_load(&s_paused); }
+bool voice_halted(void) { return atomic_load(&s_voice_diag_phase) == VOICE_DIAG_HALTED; }
 #endif
 
 void voice_replay(void) {
@@ -282,8 +285,19 @@ static void dial_task(void *arg) {
         }
 #endif
         int steps = voice_board_dial_steps();
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+        voice_dial_mode_t dial_mode = brightness_mode ? VOICE_DIAL_BRIGHTNESS : VOICE_DIAL_VOLUME;
+#endif
 #if CONFIG_HOMEHUB_RADIO
-        if (radio_select_steps(steps)) { steps = 0; brightness_mode = false; }
+        if (radio_select_steps(steps)) {
+            steps = 0; brightness_mode = false;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+            dial_mode = VOICE_DIAL_RADIO;
+#endif
+        }
+#endif
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+        atomic_store(&s_dial_mode, dial_mode);
 #endif
         if (steps) {
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
@@ -504,7 +518,11 @@ static bool fail(const char *why) {
     unsigned lights = strstr(why, "TTS") ? 2 : strstr(why, "SPEAKER") ? 3 :
         strstr(why, "ASR") || strstr(why, "MICROPHONE") || strstr(why, "CATCH") ||
         strstr(why, "RECORDING") ? 1 : 5;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+    led_status_set_voice_failure(lights, why);
+#else
     led_status_set_voice_error(lights);
+#endif
 #else
     led_status_set_voice(LED_VOICE_ERROR);
 #endif
@@ -1068,6 +1086,7 @@ static void voice_task(void *arg) {
                 esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE) {
                 if (voice_wake_stop() != ESP_OK) {
                     fail("MICROPHONE STOP FAILED");
+                    VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
                     vTaskSuspend(NULL);
                 }
                 vTaskDelay(pdMS_TO_TICKS(20));
@@ -1080,7 +1099,11 @@ static void voice_task(void *arg) {
                     atomic_store(&s_voice_diag_error, wake_err);
                     VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
                     ESP_LOGE(TAG, "offline wake initialization failed: %s", esp_err_to_name(wake_err));
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+                    led_status_set_voice_failure(1, "WAKE INIT FAILED");
+#else
                     led_status_set_voice_error(1);
+#endif
                     vTaskSuspend(NULL);
                     continue;
                 }
@@ -1109,6 +1132,7 @@ static void voice_task(void *arg) {
             evt = (voice_event_t){.kind = EVT_PRESS, .cancel_epoch = atomic_load(&s_cancel_epoch)};
         } else if (evt.kind != EVT_RELEASE && voice_wake_stop() != ESP_OK) {
             fail("MICROPHONE STOP FAILED");
+            VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
             vTaskSuspend(NULL);
             continue;
         }
@@ -1123,6 +1147,7 @@ static void voice_task(void *arg) {
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
             if (voice_wake_stop() != ESP_OK) {
                 fail("MICROPHONE STOP FAILED");
+                VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
                 vTaskSuspend(NULL);
             }
 #endif
@@ -1138,6 +1163,7 @@ static void voice_task(void *arg) {
 #if CONFIG_HOMEHUB_OFFLINE_WAKE
             if (voice_wake_stop() != ESP_OK) {
                 fail("MICROPHONE STOP FAILED");
+                VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
                 vTaskSuspend(NULL);
             }
 #endif
@@ -1167,6 +1193,7 @@ static void voice_task(void *arg) {
         // 包括录音前取消或扬声器停止失败，都必须交还麦克风。
         if (voice_wake_stop() != ESP_OK) {
             fail("MICROPHONE STOP FAILED");
+            VOICE_DIAG_STAGE(VOICE_DIAG_HALTED);
             vTaskSuspend(NULL);
         }
 #endif

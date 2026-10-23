@@ -8,8 +8,11 @@ static inline void oled_text_at(uint8_t *frame, unsigned page, unsigned start_x,
     for (unsigned x = start_x; *text && x + PIXEL_FONT_WIDTH <= 128; x += 6, ++text) {
         unsigned c = (unsigned char)*text;
         if (c < PIXEL_FONT_FIRST || c > PIXEL_FONT_LAST) c = '?';
-        for (unsigned col = 0; col < PIXEL_FONT_WIDTH; ++col)
-            frame[page * 128 + x + col] = pixel_font[c - PIXEL_FONT_FIRST][col];
+        for (unsigned col = 0; col < PIXEL_FONT_WIDTH; ++col) {
+            uint8_t pixels = pixel_font[c - PIXEL_FONT_FIRST][col];
+            // 原字体的波浪号靠顶；OLED估算符号下移2像素，与数字中线对齐。
+            frame[page * 128 + x + col] = c == '~' ? (uint8_t)(pixels << 2) : pixels;
+        }
     }
 }
 

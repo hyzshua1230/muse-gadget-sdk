@@ -11,3 +11,5 @@ bool muse_qwen_asr_audio(const uint8_t *pcm, size_t bytes, uint32_t generation);
 bool muse_qwen_asr_finish(uint32_t generation);
 int muse_qwen_asr_result(uint32_t generation, char **text);
 void muse_qwen_asr_cancel(void);
+// 固定脱敏类别，不返回服务端正文或请求地址。
+const char *muse_qwen_asr_error(void);

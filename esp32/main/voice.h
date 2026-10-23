@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "sdkconfig.h"
 #include <stdbool.h>
 #include "cJSON.h"
 
@@ -29,8 +30,11 @@
 // the button whenever a turn can run.
 void voice_init(void);
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
+typedef enum { VOICE_DIAL_VOLUME, VOICE_DIAL_BRIGHTNESS, VOICE_DIAL_RADIO } voice_dial_mode_t;
+voice_dial_mode_t voice_dial_mode(void);
 int voice_volume(void);
 bool voice_playback_paused(void);
+bool voice_halted(void);
 #endif
 
 /* EasyInput：按键任务仅提交请求，音频任务执行取消；不会转为再次录音。 */

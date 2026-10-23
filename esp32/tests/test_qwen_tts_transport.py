@@ -19,6 +19,7 @@ class QwenTransportTest(unittest.TestCase):
         fetch = production[production.index('static esp_err_t transport_event('):production.index('static bool synthesize(')]
         harness = r'''
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -39,6 +40,7 @@ static char log_line[256];
 static const char *payload, *error_code;
 static bool complete;
 static bool current(uint32_t gen) { return generation==gen; }
+static std::atomic<const char *> s_error{"service"};
 static int64_t esp_timer_get_time() { return now; }
 static void vTaskDelay(int ms) { now+=int64_t(ms)*1000; }
 struct esp_http_client_event_t { int event_id; void *client; };

@@ -15,6 +15,7 @@
  */
 
 #include "easyinput_board.h"
+#include "easyinput_brightness.h"
 #include <stdatomic.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -91,7 +92,8 @@ esp_err_t easyinput_board_init(void) {
 
 void easyinput_board_green(bool ready) {
     // 工作灯最高使用约1/4占空比；与灯条共同受百分比设置控制。
-    unsigned duty = ready ? (unsigned)atomic_load(&s_brightness) * 256 / 100 : 0;
+    unsigned duty = ready ? easyinput_brightness_scale(256, atomic_load(&s_brightness)) : 0;
+    if (ready && duty == 0) duty = 1;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3);
 }

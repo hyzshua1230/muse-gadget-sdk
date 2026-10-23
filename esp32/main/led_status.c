@@ -16,6 +16,9 @@
 
 #include "led_status.h"
 #include "stack_monitor.h"
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+#include "voice_failure_text.h"
+#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -38,6 +41,7 @@
 #include "led_strip.h"
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
 #include "easyinput_board.h"
+#include "easyinput_brightness.h"
 #if CONFIG_HOMEHUB_VOICE
 #include "network_feedback.h"
 #endif
@@ -243,6 +247,13 @@ static bool s_title_dirty = false;
 #if CONFIG_HOMEHUB_VOICE
 static led_voice_t s_voice = LED_VOICE_IDLE;
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
+static voice_failure_text_t s_oled_failure = {"AI: ERROR", "HOLD S5: STATUS"};
+void led_status_oled_failure(const char **status, const char **hint) {
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *status = s_oled_failure.status;
+    *hint = s_oled_failure.hint;
+    if (s_mutex) xSemaphoreGive(s_mutex);
+}
 void led_status_oled_snapshot(led_voice_t *voice, bool *radio_dark) {
     *voice = LED_VOICE_IDLE;
     if (s_mutex) {
@@ -383,10 +394,9 @@ static void ring_show(const rgb_t *px) {
     for (int i = 0; i < RING_LEDS; i++) {
         if (led_strip_set_pixel(s_strip, i,
 #if CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2
-                // 百分比控制既有柔和上限，非零通道至少保留一级。
-                px[i].r ? 1 + ((px[i].r > 50 ? 50 : px[i].r) - 1) * brightness / 400 : 0,
-                px[i].g ? 1 + ((px[i].g > 50 ? 50 : px[i].g) - 1) * brightness / 400 : 0,
-                px[i].b ? 1 + ((px[i].b > 50 ? 50 : px[i].b) - 1) * brightness / 400 : 0
+                easyinput_brightness_channel(px[i].r, brightness),
+                easyinput_brightness_channel(px[i].g, brightness),
+                easyinput_brightness_channel(px[i].b, brightness)
 #else
                 px[i].r, px[i].g, px[i].b
 #endif
@@ -1336,6 +1346,9 @@ void led_status_set_voice(led_voice_t voice) {
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_voice = voice;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+    s_oled_failure = voice_failure_text(NULL);
+#endif
     xSemaphoreGive(s_mutex);
     if (s_task) xTaskNotifyGive(s_task);
 }
@@ -1372,10 +1385,24 @@ void led_status_set_voice_error(unsigned lights) {
     if (!s_mutex) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_error_lights = lights >= 1 && lights <= 5 ? lights : 5;
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+    s_oled_failure = voice_failure_text(NULL);
+#endif
     s_voice = LED_VOICE_ERROR;
     xSemaphoreGive(s_mutex);
     if (s_task) xTaskNotifyGive(s_task);
 }
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+void led_status_set_voice_failure(unsigned lights, const char *why) {
+    if (!s_mutex) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_error_lights = lights >= 1 && lights <= 5 ? lights : 5;
+    s_oled_failure = voice_failure_text(why);
+    s_voice = LED_VOICE_ERROR;
+    xSemaphoreGive(s_mutex);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+#endif
 #endif
 
 void led_status_set_level(float level) {

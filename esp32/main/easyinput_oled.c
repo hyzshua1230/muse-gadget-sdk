@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "easyinput_board.h"
+#include "easyinput_brightness.h"
 #include "led_status.h"
 #include "network_feedback.h"
 #include "oled_text.h"
@@ -25,13 +26,13 @@ static const char *TAG = "link.oled";
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_device;
 static atomic_llong s_headpat_until;
+// 仅由 OLED 任务维护；其他任务通过原子活动时间通知。
 static int64_t s_last_active_time;
 static bool s_is_sleeping;
 
 void easyinput_oled_headpat(void) {
     int64_t now = esp_timer_get_time();
     atomic_store(&s_headpat_until, now + 3500000LL);
-    s_last_active_time = now;
 }
 
 static esp_err_t commands(const uint8_t *data, size_t size) {
@@ -56,11 +57,11 @@ static esp_err_t display_frame(const uint8_t *frame) {
 
 static const char *network_short_label(int state) {
     switch (state) {
-        case 0: return "NET: SETUP APP";
-        case 1: return "NET: WIFI CONN";
-        case 2: return "NET: SRV CONN";
-        case 3: return "NET: PAIR APP";
-        case 4: return "NET: ONLINE";
+        case NET_SETUP: return "NET: SETUP";
+        case NET_WIFI: return "NET: WIFI...";
+        case NET_SERVICE: return "NET: MUSE...";
+        case NET_PAIR: return "NET: PAIR";
+        case NET_READY: return "NET: ONLINE";
         default: return "NET: CONNECT";
     }
 }
@@ -178,6 +179,25 @@ static const uint8_t s_robot_love[128] = {
     0x21, 0x21, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x10, 0x08, 0x08, 0x07, 0x00, 0x00
 };
 
+// 暂定电压估算刻度，非已标定的剩余容量；4215mV来自本机满电采样。
+// 只用于带 ~ 标记的显示，不参与充电、低电量阈值或关机控制。
+static int battery_percent_estimate(int mv) {
+    static const int points[][2] = {
+        {3300, 0}, {3500, 5}, {3600, 10}, {3700, 20}, {3800, 40},
+        {3900, 60}, {4000, 80}, {4100, 90}, {4215, 100},
+    };
+    if (mv <= 0) return -1;
+    if (mv <= points[0][0]) return 0;
+    for (unsigned i = 1; i < sizeof(points) / sizeof(points[0]); ++i) {
+        if (mv <= points[i][0]) {
+            int span = points[i][0] - points[i-1][0];
+            return points[i-1][1] + ((mv - points[i-1][0]) *
+                (points[i][1] - points[i-1][1]) + span/2) / span;
+        }
+    }
+    return 100;
+}
+
 static void render(uint8_t *frame, led_voice_t voice) {
     int state = network_feedback_state();
     int mv; bool external, charging;
@@ -187,61 +207,97 @@ static void render(uint8_t *frame, led_voice_t voice) {
     int64_t now = esp_timer_get_time();
     int64_t headpat_until = atomic_load(&s_headpat_until);
     bool headpat = now < headpat_until;
+    bool muted = easyinput_board_muted();
+    bool paused = voice_playback_paused();
+    bool halted = voice_halted();
+    bool hungry = (!charging && !external && mv > 0 && mv < 3550);
 
+    // 即使电台熄屏期间的活动已结束，也不丢失最后一次活动时间。
+    int64_t activity = headpat_until - 3500000LL;
+    if (activity > s_last_active_time) s_last_active_time = activity;
     if (voice != LED_VOICE_IDLE || headpat || charging) {
         s_last_active_time = now;
     }
     if (s_last_active_time == 0) s_last_active_time = now;
 
-    bool sleeping = (voice == LED_VOICE_IDLE && !headpat && !charging &&
+    bool sleeping = (voice == LED_VOICE_IDLE && state == NET_READY &&
+                     !muted && !paused && !halted && !headpat && !charging && !hungry &&
                      (now - s_last_active_time > 45000000LL));
     s_is_sleeping = sleeping;
 
-    bool hungry = (!charging && !external && mv > 0 && mv < 3550);
-
-    // 1. 动态表情与心情状态选择 (32x32)
+    // 功能状态优先于桌宠心情；右侧每行最多 15 个 ASCII 字符。
     const uint8_t *avatar = s_robot_idle;
-    const char *pet_mood = "AI:  READY";
+    const char *status = "AI: READY";
+    const char *hint = "S1 HOLD TO TALK";
+    const char *shortcut = "S5 NEWS  S8 STORY";
 
-    if (voice == LED_VOICE_LISTENING || voice == LED_VOICE_END_CANDIDATE) {
-        avatar = s_robot_listen;
-        pet_mood = "MIC: LISTENING";
-    } else if (voice == LED_VOICE_SPEAKING || voice == LED_VOICE_BUFFERING) {
-        avatar = s_robot_speak;
-        pet_mood = "AI:  SPEAKING";
-    } else if (voice == LED_VOICE_THINKING || voice == LED_VOICE_TRANSCRIBING) {
-        avatar = s_robot_idle;
-        pet_mood = "AI:  THINKING";
+    if (muted) {
+        status = "MIC: MUTED";
+        hint = "S2 TO UNMUTE";
+        shortcut = "S2 UNMUTE";
+    } else if (halted) {
+        avatar = s_robot_hungry;
+        status = "VOICE: STOPPED";
+        hint = "CHECK FIRMWARE";
     } else if (voice == LED_VOICE_ERROR) {
         avatar = s_robot_hungry;
-        pet_mood = "AI:  ERROR";
+        led_status_oled_failure(&status, &hint);
+    } else if (voice == LED_VOICE_REPLAY_WAIT) {
+        status = "REPLAY: WAIT";
+        hint = "AUTO RESUME";
+        shortcut = "S4 CANCEL WAIT";
+    } else if (paused) {
+        status = "AUDIO: PAUSED";
+        hint = "S3 TO RESUME";
+        shortcut = "S3 RESUME  S4 CANCEL";
+    } else if (voice == LED_VOICE_LISTENING || voice == LED_VOICE_END_CANDIDATE) {
+        avatar = s_robot_listen;
+        status = voice == LED_VOICE_LISTENING ? "MIC: RECORDING" : "MIC: PAUSE";
+        hint = "KEEP TALKING";
+        shortcut = "S4 CANCEL";
+    } else if (voice == LED_VOICE_TRANSCRIBING) {
+        status = "AI: RECOGNIZING";
+        hint = "PLEASE WAIT";
+        shortcut = "S4 CANCEL";
+    } else if (voice == LED_VOICE_THINKING) {
+        status = "AI: THINKING";
+        hint = "PLEASE WAIT";
+        shortcut = "S4 CANCEL";
+    } else if (voice == LED_VOICE_BUFFERING) {
+        status = "AUDIO: LOADING";
+        hint = "PLEASE WAIT";
+        shortcut = "S4 CANCEL";
+    } else if (voice == LED_VOICE_SPEAKING) {
+        avatar = s_robot_speak;
+        status = "AUDIO: PLAYING";
+        hint = "S4 TO PAUSE";
+        shortcut = "S4 PAUSE  DIAL VOL";
+    } else if (state != NET_READY) {
+        status = "AI: NOT READY";
+        hint = state == NET_SETUP || state == NET_PAIR ? "OPEN MUSE APP" : "HOLD S5: STATUS";
     } else if (headpat) {
         avatar = s_robot_love;
-        pet_mood = "AI:  HEART <3";
+        status = "AI: HEART <3";
     } else if (charging) {
         avatar = s_robot_charging;
-        pet_mood = "AI:  YUMMY!";
+        status = "BAT: CHARGING";
     } else if (hungry) {
         avatar = s_robot_hungry;
-        pet_mood = "AI:  HUNGRY!";
+        status = "BAT: LOW";
+        hint = "PLUG IN USB";
     } else if (sleeping) {
         avatar = s_robot_sleep;
-        pet_mood = "AI:  ZZZ...";
-    } else if (easyinput_board_muted()) {
-        avatar = s_robot_idle;
-        pet_mood = "MIC: MUTED";
-    } else if (voice_playback_paused()) {
-        avatar = s_robot_idle;
-        pet_mood = "S3:  PAUSED";
+        status = "AI: SLEEPING";
+        hint = "TURN DIAL: WAKE";
     }
 
     oled_draw_icon32(frame, 0, 2, avatar);
 
     // 2. 右侧核心状态 (Page 0..3)
-    oled_text_at(frame, 0, 36, "EasyInput");
-    oled_text_at(frame, 1, 36, "Cyber Pet");
-    oled_text_at(frame, 2, 36, network_short_label(state));
-    oled_text_at(frame, 3, 36, pet_mood);
+    oled_text_at(frame, 0, 36, "TinyPal");
+    oled_text_at(frame, 1, 36, network_short_label(state));
+    oled_text_at(frame, 2, 36, status);
+    oled_text_at(frame, 3, 36, hint);
 
     // 3. Page 4 顶部绘制微细虚线分割线 (y=32)
     for (unsigned col = 0; col < 128; col += 2) {
@@ -250,24 +306,29 @@ static void render(uint8_t *frame, led_voice_t voice) {
 
     // 4. 下半部 (Page 5..7, 全屏宽 128 像素) 显示硬件参数与快捷键
     char line[24];
-    snprintf(line, sizeof(line), "VOL %3d%%  LIGHT %3d%%", voice_volume(), easyinput_board_brightness());
+    voice_dial_mode_t dial = voice_dial_mode();
+    snprintf(line, sizeof(line), "%cVOL %3d%% %cBRI %3d%%",
+             dial == VOICE_DIAL_VOLUME ? '>' : ' ', voice_volume(),
+             dial == VOICE_DIAL_BRIGHTNESS ? '>' : ' ', easyinput_board_brightness());
     oled_text_line(frame, 5, line);
 
-    if (mv > 0) {
-        snprintf(line, sizeof(line), "BAT %dmV %s", mv, hungry ? "LOW!" : charging ? "CHG" : external ? "USB" : "BAT");
+    int percent = battery_percent_estimate(mv);
+    if (mv > 0 && mv <= 9999 && percent >= 0 && percent <= 100) {
+        snprintf(line, sizeof(line), "BAT ~%d%% %d.%02dV %s", percent,
+                 mv / 1000, (mv % 1000) / 10,
+                 hungry ? "LOW" : charging ? "CHG" : external ? "USB" : "");
     } else {
-        snprintf(line, sizeof(line), "BAT --mV %s", external ? "USB" : "BAT");
+        snprintf(line, sizeof(line), "BAT --%% --V %s", charging ? "CHG" : external ? "USB" : "");
     }
     oled_text_line(frame, 6, line);
 
-    if (sleeping) {
-        oled_text_line(frame, 7, "S1:WAKE UP  S5:NEWS");
-    } else if (hungry) {
-        oled_text_line(frame, 7, "FEED ME: PLUG USB!");
-    } else if (charging) {
-        oled_text_line(frame, 7, "CHARGING... S8:STORY");
+    if (dial == VOICE_DIAL_BRIGHTNESS) {
+        snprintf(line, sizeof(line), "BRIGHTNESS: %3d%%", easyinput_board_brightness());
+        oled_text_line(frame, 7, line);
+    } else if (dial == VOICE_DIAL_RADIO) {
+        oled_text_line(frame, 7, "RADIO: TURN TO PICK");
     } else {
-        oled_text_line(frame, 7, "S5 NEWS  S8 STORY");
+        oled_text_line(frame, 7, shortcut);
     }
 }
 
@@ -310,18 +371,41 @@ static void oled_task(void *arg) {
     esp_err_t err = frames ? start_panel() : ESP_ERR_NO_MEM;
     bool on = false, first = true;
     unsigned contrast = 0;
+    unsigned precharge = 0;
+    int logged_percent = -1;
+    bool logged_sleeping = false, logged_dark = false;
     while (err == ESP_OK) {
         led_voice_t voice; bool dark;
         led_status_oled_snapshot(&voice, &dark);
+        int percent = easyinput_board_brightness();
         // 沿用电台的实际熄灯状态，AI打断期间仍可显示；不改电台所有权。
         if (dark) {
-            if (on) { const uint8_t off[] = {0xae}; err = commands(off, sizeof(off)); on = false; }
+            if (on) {
+                const uint8_t off[] = {0xae}; err = commands(off, sizeof(off)); on = false;
+                ESP_LOGI(TAG, "power diag: command=0xae result=%s", esp_err_to_name(err));
+            }
+            if (percent != logged_percent || !logged_dark)
+                ESP_LOGI(TAG, "brightness diag: requested=%d dark=1 action=deferred", percent);
         } else {
             render(frames, voice);
-            unsigned level = s_is_sleeping ? 1 : (1 + easyinput_board_brightness() * 63 / 100);
-            if (contrast != level) {
+            unsigned level = s_is_sleeping ? 1 : (1 + easyinput_brightness_scale(63, percent));
+            unsigned period = easyinput_oled_precharge(s_is_sleeping ? 1 : percent);
+            if (precharge != period) {
+                const uint8_t timing[] = {0xd9, period};
+                err = commands(timing, sizeof(timing));
+                if (err == ESP_OK) precharge = period;
+                ESP_LOGI(TAG, "precharge diag: requested=%d sleeping=%d command=0xd9 value=0x%02x result=%s",
+                         percent, (int)s_is_sleeping, period, esp_err_to_name(err));
+            }
+            if (err == ESP_OK && contrast != level) {
                 const uint8_t brightness[] = {0x81, level};
                 err = commands(brightness, sizeof(brightness)); contrast = level;
+                // 仅记录固定参数和传输结果；ESP_OK不代表已测得光学亮度变化。
+                ESP_LOGI(TAG, "brightness diag: requested=%d sleeping=%d dark=0 command=0x81 value=0x%02x action=write result=%s",
+                         percent, (int)s_is_sleeping, level, esp_err_to_name(err));
+            } else if (err == ESP_OK && (percent != logged_percent || s_is_sleeping != logged_sleeping || logged_dark)) {
+                ESP_LOGI(TAG, "brightness diag: requested=%d sleeping=%d dark=0 command=0x81 value=0x%02x action=cached result=not_sent",
+                         percent, (int)s_is_sleeping, level);
             }
             if (err == ESP_OK && (first || memcmp(frames, frames + 1024, 1024))) {
                 err = display_frame(frames);
@@ -329,8 +413,12 @@ static void oled_task(void *arg) {
             }
             if (err == ESP_OK && !on) {
                 const uint8_t enable[] = {0xaf}; err = commands(enable, sizeof(enable)); on = err == ESP_OK;
+                ESP_LOGI(TAG, "power diag: command=0xaf result=%s", esp_err_to_name(err));
             }
         }
+        logged_percent = percent;
+        logged_sleeping = s_is_sleeping;
+        logged_dark = dark;
         if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(500));
     }
     ESP_LOGE(TAG, "display stopped: %s; check J4 wiring and 3.3V pull-ups", esp_err_to_name(err));

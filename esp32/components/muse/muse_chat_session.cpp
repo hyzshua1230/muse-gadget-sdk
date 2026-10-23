@@ -1172,6 +1172,15 @@ static void turn_fail(const char *why)
     turn_finish();
 }
 
+#if CONFIG_HOMEHUB_QWEN_ASR || CONFIG_HOMEHUB_QWEN_TTS
+// 只携带客户端固定类别；不用服务端错误正文构造事件。
+static void qwen_turn_fail(const char *stage, const char *category) {
+    char why[64];
+    snprintf(why, sizeof(why), "%s (%s)", stage, category);
+    turn_fail(why);
+}
+#endif
+
 /* Ends the turn once its reply is in; `complete` is false when it was cut off. */
 static void turn_done(bool complete)
 {
@@ -1232,7 +1241,7 @@ static void turn_begin(uint32_t gen)
     }
 #if CONFIG_HOMEHUB_QWEN_ASR
     if (!muse_qwen_asr_begin(gen)) {
-        turn_fail("QWEN ASR START FAILED");
+        qwen_turn_fail("QWEN ASR START FAILED", muse_qwen_asr_error());
         return;
     }
     s_turn.phase = P_LISTEN;
@@ -1449,13 +1458,13 @@ static void post_chat(const char *text)
 static void record_qwen(void)
 {
     int ready = muse_qwen_asr_ready(s_turn.gen);
-    if (ready < 0) { turn_fail("QWEN ASR CONNECTION FAILED"); return; }
+    if (ready < 0) { qwen_turn_fail("QWEN ASR CONNECTION FAILED", muse_qwen_asr_error()); return; }
     if (!ready) return;
     static uint8_t pcm[3200];
     size_t got = xStreamBufferReceive(s_in, pcm, sizeof(pcm), 0);
     if (got) {
         if (!muse_qwen_asr_audio(pcm, got, s_turn.gen)) {
-            turn_fail("QWEN ASR AUDIO SEND FAILED"); return;
+            qwen_turn_fail("QWEN ASR AUDIO SEND FAILED", muse_qwen_asr_error()); return;
         }
         s_turn.pcm_bytes += got;
     }
@@ -1467,7 +1476,7 @@ static void record_qwen(void)
     }
     ESP_LOGI(TAG, "Qwen ASR recording: %.2fs", double(s_turn.pcm_bytes) / (MIC_RATE * 2));
     if (!muse_qwen_asr_finish(s_turn.gen)) {
-        turn_fail("QWEN ASR COMMIT FAILED"); return;
+        qwen_turn_fail("QWEN ASR COMMIT FAILED", muse_qwen_asr_error()); return;
     }
     s_turn.end_sent_us = now_us();
     s_turn.phase = P_WAIT_ASR;
@@ -1483,7 +1492,7 @@ static void poll_qwen_asr(void)
     char *text = nullptr;
     int result = muse_qwen_asr_result(s_turn.gen, &text);
     if (result > 0) post_chat(text);
-    else if (result < 0) turn_fail("QWEN ASR FAILED");
+    else if (result < 0) qwen_turn_fail("QWEN ASR FAILED", muse_qwen_asr_error());
     free(text);
 }
 #endif
@@ -1931,7 +1940,7 @@ static void decode(void)
     }
     if (!s_qwen_pcm) {
         int result = muse_qwen_tts_result(s_turn.gen, &s_qwen_pcm, &s_qwen_frames);
-        if (result < 0) { turn_fail("QWEN TTS FAILED"); return; }
+        if (result < 0) { qwen_turn_fail("QWEN TTS FAILED", muse_qwen_tts_error()); return; }
         if (!result) return;
         s_qwen_position = 0;
         resampler_init(&s_turn.down, 24000, MIC_RATE);

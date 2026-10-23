@@ -82,6 +82,8 @@ typedef enum {
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
 // 只读取已发布状态；OLED任务不持有LED锁执行I2C。
 void led_status_oled_snapshot(led_voice_t *voice, bool *radio_dark);
+void led_status_oled_failure(const char **status, const char **hint);
+void led_status_set_voice_failure(unsigned lights, const char *why);
 #endif
 
 void led_status_set_voice(led_voice_t voice);

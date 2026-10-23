@@ -18,6 +18,8 @@
 
 static std::atomic<int> s_status{0}; // 0空闲，1请求中，2完成，-1失败
 static std::atomic<uint32_t> s_generation{0};
+static std::atomic<const char *> s_error{"service"};
+const char *muse_qwen_tts_error(void) { return s_error.load(); }
 static int16_t *s_pcm;
 static size_t s_frames;
 struct request_t { char *text; uint32_t generation; };
@@ -50,7 +52,7 @@ static bool append_wav(uint8_t *wav, size_t bytes) {
             muse_hatch_replay_make_room(s_frames * 2 + actual);
 #endif
             auto *next = static_cast<int16_t *>(heap_caps_realloc(s_pcm, s_frames * 2 + actual, MALLOC_CAP_SPIRAM));
-            if (!next) return false;
+            if (!next) { s_error.store("memory"); return false; }
             s_pcm = next;
             memcpy(s_pcm + s_frames, wav + begin, actual);
             s_frames += actual / 2;
@@ -174,6 +176,7 @@ static uint8_t *fetch(const char *url, const char *body, size_t limit, uint32_t 
             category = muse_qwen_service_error(status, code);
             cJSON_Delete(error);
         } else if (buffer_error) category = "buffer_limit";
+        s_error.store(category);
         ESP_LOGW("qwen_tts", "%s failed: category=%s http=%d bytes=%u", stage, category, status, unsigned(used));
     } else ESP_LOGI("qwen_tts", "%s complete (%u bytes)", stage, unsigned(used));
     // 句柄与接收缓冲区由本任务独占；取消只改变generation，不跨任务close。
@@ -220,8 +223,11 @@ static bool synthesize(const char *text, uint32_t gen) {
     auto wav = fetch(secure, nullptr, AUDIO_LIMIT, gen, &bytes, "audio download");
     free(secure);
     bool owned = s_frames == 0;
+    if (wav) s_error.store("format");
     bool ok = wav && append_wav(wav, bytes);
-    if (wav && !ok) ESP_LOGW("qwen_tts", "unsupported or invalid WAV");
+    if (wav && !ok) {
+        ESP_LOGW("qwen_tts", "unsupported or invalid WAV");
+    }
     if (!ok || !owned) free(wav);
     return ok;
 }
@@ -257,13 +263,15 @@ bool muse_qwen_tts_start(const char *text, uint32_t generation) {
     if (!text || !*text || !generation) return false;
     if (s_status.load() != 1 && s_generation.load() == 0) muse_qwen_tts_cancel();
     if (s_status.load() != 0) return false;
+    s_error.store("service");
     auto req = static_cast<request_t *>(calloc(1, sizeof(request_t)));
-    if (!req) { s_status.store(-1); return true; }
+    if (!req) { s_error.store("memory"); s_status.store(-1); return true; }
     req->text = strdup(text);
     req->generation = generation;
     s_generation.store(generation);
     s_status.store(1);
     if (!req->text || xTaskCreate(worker, "qwen_tts", 8192, req, 3, nullptr) != pdPASS) {
+        s_error.store("memory");
         free(req->text); free(req); s_status.store(-1);
     }
     return true;

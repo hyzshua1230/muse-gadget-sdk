@@ -17,6 +17,8 @@
 // 生命周期与发送仅由hatch任务调用；回调只接收并发布状态。
 static std::atomic<uint32_t> s_generation{0};
 static std::atomic<int> s_status{0}; // 0空闲、1连接、2采音、3结束确认、4完成、-1失败
+static std::atomic<const char *> s_error{"service"};
+const char *muse_qwen_asr_error(void) { return s_error.load(); }
 static std::atomic<bool> s_created{false};
 static esp_websocket_client_handle_t s_client;
 static char *s_rx, *s_tx, *s_text;
@@ -54,7 +56,9 @@ static void receive_event(const char *json) {
         // 不打印服务端正文，避免凭据或用户音频内容进入错误日志。
         auto *error = cJSON_GetObjectItem(root, "error");
         const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(error, "code"));
-        ESP_LOGW("qwen_asr", "realtime service rejected request: category=%s", muse_qwen_service_error(0, code));
+        const char *category = muse_qwen_service_error(0, code);
+        s_error.store(category);
+        ESP_LOGW("qwen_asr", "realtime service rejected request: category=%s", category);
         s_status.store(-1);
     }
     cJSON_Delete(root);
@@ -65,11 +69,13 @@ static void websocket_event(void *arg, esp_event_base_t, int32_t event, void *pa
     if (!gen || s_generation.load() != gen || s_status.load() == -1 || s_status.load() == 4) return;
     auto data = static_cast<esp_websocket_event_data_t *>(payload);
     if (event == WEBSOCKET_EVENT_ERROR || event == WEBSOCKET_EVENT_DISCONNECTED) {
+        if (event == WEBSOCKET_EVENT_DISCONNECTED) s_error.store("transport");
         if (event == WEBSOCKET_EVENT_ERROR && data) {
             const auto &err = data->error_handle;
             const char *category = err.esp_tls_last_esp_err == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME ? "dns" :
                 err.esp_tls_last_esp_err == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT || err.esp_transport_sock_errno == ETIMEDOUT ? "timeout" :
                 err.esp_ws_handshake_status_code >= 400 ? muse_qwen_service_error(err.esp_ws_handshake_status_code, nullptr) : "transport";
+            s_error.store(category);
             ESP_LOGW("qwen_asr", "realtime connection failed: category=%s", category);
         }
         if (s_status.load() != 4) s_status.store(-1);
@@ -106,10 +112,11 @@ static bool send_json(const char *text, size_t len) {
 
 bool muse_qwen_asr_begin(uint32_t gen) {
     muse_qwen_asr_cancel();
+    s_error.store("service");
     if (!gen) return false;
     s_rx = static_cast<char *>(heap_caps_malloc(RX_BYTES, MALLOC_CAP_SPIRAM));
     s_tx = static_cast<char *>(heap_caps_malloc(TX_BYTES, MALLOC_CAP_SPIRAM));
-    if (!s_rx || !s_tx) { muse_qwen_asr_cancel(); return false; }
+    if (!s_rx || !s_tx) { s_error.store("memory"); muse_qwen_asr_cancel(); return false; }
     char headers[256];
     int len = snprintf(headers, sizeof(headers), "Authorization: Bearer %s\r\n", CONFIG_HOMEHUB_QWEN_API_KEY);
     if (len <= 0 || len >= static_cast<int>(sizeof(headers))) { muse_qwen_asr_cancel(); return false; }
@@ -141,6 +148,7 @@ int muse_qwen_asr_ready(uint32_t gen) {
     if (s_generation.load() != gen || s_status.load() < 0) return -1;
     if (s_status.load() == 2) return 1;
     if (esp_timer_get_time() >= s_connect_deadline) {
+        s_error.store("timeout");
         ESP_LOGW("qwen_asr", "realtime connection failed: category=timeout");
         s_status.store(-1); return -1;
     }
