@@ -169,6 +169,13 @@ static atomic_bool s_busy;
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
 static atomic_int s_dial_mode;
 voice_dial_mode_t voice_dial_mode(void) { return atomic_load(&s_dial_mode); }
+int voice_radio_station(void) {
+#if CONFIG_HOMEHUB_RADIO
+    return radio_station();
+#else
+    return -1;
+#endif
+}
 int voice_volume(void) { return atomic_load(&s_volume); }
 bool voice_playback_paused(void) { return atomic_load(&s_paused); }
 bool voice_halted(void) { return atomic_load(&s_voice_diag_phase) == VOICE_DIAG_HALTED; }
@@ -258,6 +265,7 @@ static void dial_task(void *arg) {
         bool quiet=easyinput_board_muted() || atomic_load(&s_busy) || atomic_load(&s_paused);
 #if CONFIG_HOMEHUB_RADIO
         quiet=quiet || radio_enabled();
+        radio_poll_storage();
 #endif
         network_feedback_poll(quiet);
         if (now >= diagnostic_at) {

@@ -111,6 +111,8 @@ void easyinput_board_power(int *millivolts, bool *external, bool *charging) {
 }
 
 static void battery_task(void *arg) {
+  int smoothed_mv = 0;
+  bool last_ext = false;
   for (;;) {
     int measured_mv = 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -130,10 +132,19 @@ static void battery_task(void *arg) {
         measured_mv = mv * 2;
     gpio_set_level(GPIO_NUM_5, 0);
     xSemaphoreGive(s_lock);
-    atomic_store(&s_battery_mv, measured_mv);
-    ESP_LOGI("link.easyinput", "battery=%dmV external=%d charging=%d (precision unverified)",
-             measured_mv, gpio_get_level(GPIO_NUM_40) == 0,
-             gpio_get_level(GPIO_NUM_40) == 0 && gpio_get_level(GPIO_NUM_39) != 0);
+    bool ext = gpio_get_level(GPIO_NUM_40) == 0;
+    if (measured_mv <= 0) {
+        smoothed_mv = 0;
+    } else if (smoothed_mv <= 0 || ext != last_ext) {
+        smoothed_mv = measured_mv;
+    } else {
+        smoothed_mv = (smoothed_mv * 3 + measured_mv + 2) / 4;
+    }
+    last_ext = ext;
+    atomic_store(&s_battery_mv, smoothed_mv);
+    ESP_LOGI("link.easyinput", "battery=%dmV (raw=%dmV) external=%d charging=%d (precision unverified)",
+             smoothed_mv, measured_mv, ext,
+             ext && gpio_get_level(GPIO_NUM_39) != 0);
     vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }

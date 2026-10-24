@@ -1,4 +1,5 @@
 #include "radio.h"
+#include "radio_assets/stations.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -16,6 +17,7 @@
 #include "minimp3.h"
 #include "voice_board.h"
 #include "led_status.h"
+#include "config_store.h"
 
 #define INPUT_BYTES 16384
 // 本工具链的MP3解码函数单独占用16608字节栈，另留调用链和运行余量。
@@ -23,19 +25,29 @@
 #define SESSION_US (60LL * 60 * 1000000)
 #define FADE_US (5LL * 60 * 1000000)
 static const char *TAG = "radio";
-static const char *urls[2][2] = {
-    {"http://lhttp.qingting.fm/live/267/64k.mp3", "https://lhttp.qingting.fm/live/267/64k.mp3"},
-    {"https://ice5.somafm.com/dronezone-128-mp3", "https://ice5.somafm.com/dronezone-128-mp3"}
+static const char *urls[12][2] = {
+    {"http://lhttp.qingting.fm/live/274/64k.mp3", "https://lhttp.qingting.fm/live/274/64k.mp3"},
+    {"http://lhttp.qingting.fm/live/273/64k.mp3", "https://lhttp.qingting.fm/live/273/64k.mp3"},
+    {"http://lhttp.qingting.fm/live/333/64k.mp3", "https://lhttp.qingting.fm/live/333/64k.mp3"},
+    {"http://lhttp.qingting.fm/live/386/64k.mp3", "https://lhttp.qingting.fm/live/386/64k.mp3"},
+    {"https://ice5.somafm.com/groovesalad-128-mp3", "https://ice2.somafm.com/groovesalad-128-mp3"},
+    {"https://ice5.somafm.com/secretagent-128-mp3", "https://ice2.somafm.com/secretagent-128-mp3"},
+    {"https://playerservices.streamtheworld.com/api/livestream-redirect/KISS_92.mp3", "http://playerservices.streamtheworld.com/api/livestream-redirect/KISS_92.mp3"},
+    {"https://playerservices.streamtheworld.com/api/livestream-redirect/YES933.mp3", "http://playerservices.streamtheworld.com/api/livestream-redirect/YES933.mp3"},
+    {"https://playerservices.streamtheworld.com/api/livestream-redirect/CAPITAL958FM.mp3", "http://playerservices.streamtheworld.com/api/livestream-redirect/CAPITAL958FM.mp3"},
+    {"https://playerservices.streamtheworld.com/api/livestream-redirect/987FM.mp3", "http://playerservices.streamtheworld.com/api/livestream-redirect/987FM.mp3"},
+    {"https://live-kiss.sharp-stream.com/kiss100.mp3", "https://live-kiss.sharp-stream.com/kiss100.mp3"},
+    {"http://media-ice.musicradio.com/HeartPeterboroughMP3", "https://media-ice.musicradio.com/HeartPeterboroughMP3"}
 };
-extern const uint8_t classical_start[] asm("_binary_classical_pcm_start");
-extern const uint8_t classical_end[] asm("_binary_classical_pcm_end");
-extern const uint8_t ambient_start[] asm("_binary_ambient_pcm_start");
-extern const uint8_t ambient_end[] asm("_binary_ambient_pcm_end");
+extern const uint8_t stations_start[] asm("_binary_stations_pcm_start");
+enum { STATION_COUNT = sizeof(urls) / sizeof(urls[0]), PROMPT_REPEAT = 48000 / RADIO_PROMPT_RATE };
+_Static_assert(sizeof(radio_prompt_offsets) / sizeof(radio_prompt_offsets[0]) ==
+               sizeof(urls) / sizeof(urls[0]) + 1, "Each station needs a local prompt");
 typedef struct {
     bool enabled, blocked, output, selecting, ready;
     unsigned epoch, preview;
-    int station, candidate;
-    int64_t deadline, select_until, preview_at;
+    int station, candidate, saved_station;
+    int64_t deadline, select_until, preview_at, save_at;
 } state_t;
 static state_t s;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -43,6 +55,49 @@ static state_t snapshot(void) {
     portENTER_CRITICAL(&s_lock); state_t copy = s; portEXIT_CRITICAL(&s_lock); return copy;
 }
 bool radio_enabled(void) { state_t st=snapshot(); return st.enabled || st.selecting; }
+int radio_station(void) {
+    state_t st = snapshot();
+    if (st.selecting && esp_timer_get_time() < st.select_until) return st.candidate;
+    if (!st.enabled || st.blocked) return -1;
+    return st.output ? st.station : (100 + st.station);
+}
+// 调用方持有s_lock；候选预览不走此路径，也不触发NVS写入。
+static void select_station_locked(int station) {
+    if (s.station != station) {
+        s.station = station;
+        s.save_at = esp_timer_get_time() + 2000000;
+    }
+    ++s.epoch; s.selecting = false;
+}
+static int load_station(void) {
+    char value[4];
+    if (!config_get_str("radio_station", value, sizeof(value))) return 0;
+    size_t length = strlen(value);
+    if (length < 1 || length > 2) return 0;
+    int station = 0;
+    for (size_t i = 0; i < length; ++i) {
+        if (value[i] < '0' || value[i] > '9') return 0;
+        station = station * 10 + value[i] - '0';
+    }
+    return station < STATION_COUNT ? station : 0;
+}
+void radio_poll_storage(void) {
+    state_t st = snapshot();
+    if (!st.ready || !st.save_at || esp_timer_get_time() < st.save_at) return;
+    bool unchanged = st.station == st.saved_station;
+    char value[12];
+    snprintf(value, sizeof(value), "%d", st.station);
+    // 不持有状态锁执行Flash写入；新选台的保存期限不会被旧写入清除。
+    bool ok = unchanged || config_set_str("radio_station", value);
+    portENTER_CRITICAL(&s_lock);
+    if (ok) s.saved_station = st.station;
+    if (s.station == st.station && s.save_at == st.save_at) s.save_at = 0;
+    portEXIT_CRITICAL(&s_lock);
+    if (!unchanged) {
+        if (ok) ESP_LOGI(TAG, "station saved=%d", st.station);
+        else ESP_LOGW(TAG, "station could not be stored");
+    }
+}
 static void set_enabled(bool enabled) {
     portENTER_CRITICAL(&s_lock);
     if (s.ready && s.enabled != enabled) {
@@ -61,7 +116,7 @@ void radio_toggle(void) {
 }
 void radio_next(void) {
     portENTER_CRITICAL(&s_lock);
-    if (s.ready) { s.station = (s.station + 1) % 2; ++s.epoch; s.selecting = false; }
+    if (s.ready) select_station_locked((s.station + 1) % STATION_COUNT);
     portEXIT_CRITICAL(&s_lock);
 }
 void radio_select_mode(void) {
@@ -78,7 +133,7 @@ bool radio_select_steps(int steps) {
     portENTER_CRITICAL(&s_lock);
     handled = s.selecting && esp_timer_get_time() < s.select_until;
     if (handled && steps) {
-        s.candidate = (s.candidate + steps % 2 + 2) % 2;
+        s.candidate = (s.candidate + steps % STATION_COUNT + STATION_COUNT) % STATION_COUNT;
         s.select_until = esp_timer_get_time() + 5000000;
         s.preview_at = esp_timer_get_time() + 800000; ++s.preview;
     }
@@ -89,7 +144,7 @@ bool radio_select_confirm(void) {
     bool handled;
     portENTER_CRITICAL(&s_lock);
     handled = s.selecting && esp_timer_get_time() < s.select_until;
-    if (handled) { s.station = s.candidate; ++s.epoch; }
+    if (handled) select_station_locked(s.candidate);
     s.selecting = false;
     portEXIT_CRITICAL(&s_lock); return handled;
 }
@@ -116,12 +171,29 @@ bool radio_voice_command(const char *text) {
     clean[n] = 0;
     if (!strcmp(clean,"打开收音机") || !strcmp(clean,"打开电台")) set_enabled(true);
     else if (!strcmp(clean,"关闭收音机") || !strcmp(clean,"关闭电台")) set_enabled(false);
-    else if (!strcmp(clean,"下一台") || !strcmp(clean,"上一台")) radio_next();
-    else {
-        int station = !strcmp(clean,"播放上海经典947") || !strcmp(clean,"播放上海经典九四七") ? 0 :
-            !strcmp(clean,"切换到环境音乐台") || !strcmp(clean,"播放环境音乐台") ? 1 : -1;
+    else if (!strcmp(clean,"下一台")) radio_next();
+    else if (!strcmp(clean,"上一台")) {
+        portENTER_CRITICAL(&s_lock);
+        if (s.ready) select_station_locked((s.station + STATION_COUNT - 1) % STATION_COUNT);
+        portEXIT_CRITICAL(&s_lock);
+    } else {
+        int station =
+            !strcmp(clean,"播放动感101") || !strcmp(clean,"播放动感一零一") || !strcmp(clean,"播放流行音乐") ? 0 :
+            !strcmp(clean,"播放怀旧金曲") || !strcmp(clean,"播放经典老歌") ? 1 :
+            !strcmp(clean,"播放北京文艺广播") || !strcmp(clean,"播放相声") || !strcmp(clean,"播放评书") ? 2 :
+            !strcmp(clean,"播放中国之声") || !strcmp(clean,"播放新闻电台") ? 3 :
+            !strcmp(clean,"播放环境音乐台") || !strcmp(clean,"播放轻电音") ? 4 :
+            !strcmp(clean,"播放爵士乐") || !strcmp(clean,"播放复古爵士") ? 5 :
+            !strcmp(clean,"播放KISS92") || !strcmp(clean,"播放新加坡英语台") ? 6 :
+            !strcmp(clean,"播放YES933") || !strcmp(clean,"播放九三三") || !strcmp(clean,"播放新加坡音乐台") ? 7 :
+            !strcmp(clean,"播放958") || !strcmp(clean,"播放城市频道") || !strcmp(clean,"播放新加坡新闻台") ? 8 :
+            !strcmp(clean,"播放987") || !strcmp(clean,"播放九八七") ? 9 :
+            !strcmp(clean,"播放KISS100") || !strcmp(clean,"播放伦敦电台") ? 10 :
+            !strcmp(clean,"播放英国电台") || !strcmp(clean,"播放HEART") ? 11 : -1;
         if (station < 0) return false;
-        portENTER_CRITICAL(&s_lock); s.station = station; ++s.epoch; portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock);
+        if (s.ready) select_station_locked(station);
+        portEXIT_CRITICAL(&s_lock);
         set_enabled(true);
     }
     ESP_LOGI(TAG,"local voice command accepted"); return true;
@@ -190,9 +262,8 @@ static void preview_update(audio_t *audio) {
         audio->prompt = NULL;
     } else if (st.preview != audio->preview && now >= st.preview_at) {
         audio->preview = st.preview; audio->prompt_pos = 0;
-        const uint8_t *start = st.candidate ? ambient_start : classical_start;
-        const uint8_t *end = st.candidate ? ambient_end : classical_end;
-        audio->prompt = (const int16_t *)start; audio->prompt_samples = (end-start)/2;
+        audio->prompt = (const int16_t *)stations_start + radio_prompt_offsets[st.candidate];
+        audio->prompt_samples = radio_prompt_offsets[st.candidate + 1] - radio_prompt_offsets[st.candidate];
     }
 }
 static float gain_now(int64_t started) {
@@ -206,9 +277,9 @@ static float gain_now(int64_t started) {
 static esp_err_t output(audio_t *audio, size_t count, float gain, bool prompts) {
     for (size_t i=0;i<count;++i) {
         int32_t prompt = 0;
-        bool speaking = prompts && audio->prompt && audio->prompt_pos/3 < audio->prompt_samples;
+        bool speaking = prompts && audio->prompt && audio->prompt_pos/PROMPT_REPEAT < audio->prompt_samples;
         if (speaking)
-            prompt = (int32_t)audio->prompt[audio->prompt_pos++/3] * 65536;
+            prompt = (int32_t)audio->prompt[audio->prompt_pos++/PROMPT_REPEAT] * 65536;
         float target=speaking ? 0.2f : 1.0f;
         float difference=target-audio->duck;
         audio->duck += difference>1.0f/960 ? 1.0f/960 : difference < -1.0f/960 ? -1.0f/960 : difference;
@@ -268,8 +339,8 @@ done:
 static bool play(audio_t *audio, state_t st, int url_index) {
     stream_t stream = {.epoch=st.epoch};
     esp_http_client_config_t cfg = {
-        .url = urls[st.station][url_index], .timeout_ms = 1000,
-        .crt_bundle_attach = esp_crt_bundle_attach, .buffer_size = 2048,
+        .url = urls[st.station][url_index], .timeout_ms = 4000,
+        .crt_bundle_attach = esp_crt_bundle_attach, .buffer_size = 2048, .buffer_size_tx = 1024,
         .event_handler = http_event, .user_data = &stream,
     };
     stream.client = esp_http_client_init(&cfg);
@@ -410,14 +481,14 @@ static void worker(void *arg) {
             continue;
         }
         if (!st.enabled || st.blocked) {
-            if (!st.blocked && st.selecting && audio->prompt && audio->prompt_pos/3<audio->prompt_samples) {
+            if (!st.blocked && st.selecting && audio->prompt && audio->prompt_pos/PROMPT_REPEAT<audio->prompt_samples) {
                 portENTER_CRITICAL(&s_lock);
                 bool allowed=!s.blocked;
                 if (allowed) s.output=true;
                 portEXIT_CRITICAL(&s_lock);
                 if (allowed) {
                     voice_board_amp(true);
-                    while (!snapshot().blocked && audio->prompt_pos/3<audio->prompt_samples && snapshot().selecting) {
+                    while (!snapshot().blocked && audio->prompt_pos/PROMPT_REPEAT<audio->prompt_samples && snapshot().selecting) {
                         preview_update(audio);
                         if (!audio->prompt) break;
                         memset(audio->out,0,sizeof(audio->out));
@@ -447,12 +518,17 @@ static void worker(void *arg) {
     }
 }
 esp_err_t radio_init(void) {
+    int station = load_station();
     audio_t *audio = heap_caps_calloc(1,sizeof(*audio),MALLOC_CAP_SPIRAM);
     if (!audio) return ESP_ERR_NO_MEM;
     audio->duck=1;
+    portENTER_CRITICAL(&s_lock);
+    s.station = s.saved_station = station;
+    portEXIT_CRITICAL(&s_lock);
     if (xTaskCreateWithCaps(worker,"radio",RADIO_STACK_BYTES,audio,3,NULL,MALLOC_CAP_SPIRAM) != pdPASS) {
         free(audio); return ESP_ERR_NO_MEM;
     }
     portENTER_CRITICAL(&s_lock); s.ready=true; portEXIT_CRITICAL(&s_lock);
+    ESP_LOGI(TAG, "station restored=%d; playback off", station);
     return ESP_OK;
 }

@@ -12,6 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OledTextTest(unittest.TestCase):
+    def test_radio_dark_mode_only_overridden_for_selection(self):
+        source = (ROOT / 'main/easyinput_oled.c').read_text(encoding='utf-8')
+        task = source[source.index('static void oled_task('):]
+        self.assertIn('led_status_oled_snapshot(&voice, &dark);', task)
+        self.assertEqual(re.findall(r'[^\n]*\bdark = false;', task),
+                         ['        if (voice_dial_mode() == VOICE_DIAL_RADIO) dark = false;'])
+        self.assertIn('const uint8_t off[] = {0xae}', task)
+
     def test_right_column_labels_fit(self):
         source = (ROOT / 'main/easyinput_oled.c').read_text(encoding='utf-8')
         labels = source[source.index('static const char *network_short_label'):source.index('// 32x32')]
@@ -55,8 +63,11 @@ static int64_t now = 100000000LL, s_last_active_time;
 static atomic_llong s_headpat_until;
 static bool s_is_sleeping;
 static char rows[8][24];
+static const uint8_t *last_avatar;
 static voice_dial_mode_t dial;
+static int radio_ch = -1;
 static voice_dial_mode_t voice_dial_mode(void) { return dial; }
+static int voice_radio_station(void) { return radio_ch; }
 static void led_status_oled_failure(const char **status, const char **hint) {
     *status = "NET: DNS ERROR"; *hint = "CHECK NETWORK";
 }
@@ -77,7 +88,7 @@ static void oled_text_at(uint8_t *f, unsigned p, unsigned x, const char *s) {
 }
 static void oled_text_line(uint8_t *f, unsigned p, const char *s) { oled_text_at(f,p,0,s); }
 static void oled_draw_icon32(uint8_t *f, unsigned p, unsigned x, const uint8_t *b) {
-    (void)f; (void)p; (void)x; (void)b;
+    (void)f; (void)p; (void)x; last_avatar = b;
 }
 '''
         harness += '\n'.join('static const uint8_t ' + avatar + '[128] = {0};' for avatar in avatars)
@@ -94,10 +105,39 @@ int main(void) {
     muted = true;
     render(frame, LED_VOICE_IDLE);
     assert(!strcmp(rows[2], "MIC: MUTED"));
-    muted = false; dial = VOICE_DIAL_RADIO;
+    dial = VOICE_DIAL_RADIO; radio_ch = 7;
     render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "FM: SG YES 933"));
+    assert(!strcmp(rows[3], "MUTED: DIAL OK"));
+    radio_ch = 11;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "FM: HEART 102.7"));
+    render(frame, LED_VOICE_ERROR);
+    assert(!strcmp(rows[2], "NET: DNS ERROR"));
+    halted = true;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "VOICE: STOPPED"));
+    halted = false; dial = VOICE_DIAL_VOLUME;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "MIC: MUTED"));
+    muted = false; dial = VOICE_DIAL_RADIO; radio_ch = 0;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "FM: DONGAN 101"));
+    assert(!strcmp(rows[3], "PRESS DIAL: OK"));
     assert(!strcmp(rows[7], "RADIO: TURN TO PICK"));
+    radio_ch = 11;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "FM: HEART 102.7"));
     dial = VOICE_DIAL_VOLUME;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "FM: HEART 102.7"));
+    assert(!strcmp(rows[3], "S6 TO STOP"));
+    assert(!strcmp(rows[7], "S6 STOP  S7 NEXT"));
+    radio_ch = 107;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[2], "RADIO: LOADING"));
+    assert(!strcmp(rows[3], "FM: SG YES 933"));
+    radio_ch = -1;
     assert(battery_percent_estimate(0) == -1);
     assert(battery_percent_estimate(-1) == -1);
     assert(battery_percent_estimate(3200) == 0);
@@ -123,8 +163,20 @@ int main(void) {
     assert(!strcmp(rows[2], "AI: READY"));
     now += 46000000LL;
     render(frame, LED_VOICE_IDLE); assert(s_is_sleeping);
+    assert(!strcmp(rows[3], "VOICE/KEY WAKE"));
+    assert(!strcmp(rows[7], "WAKE: NIHAOXIAOYI"));
     easyinput_oled_headpat();
     render(frame, LED_VOICE_IDLE); assert(!s_is_sleeping);
+    // 单调推进到下一次眨眼时刻，确保此前摸头提示已过期。
+    now = ((now / 7000000LL) + 1) * 7000000LL + 6500000LL;
+    s_last_active_time = now;
+    render(frame, LED_VOICE_IDLE);
+    assert(last_avatar == s_robot_blink);
+    render(frame, LED_VOICE_SPEAKING);
+    assert(last_avatar == s_robot_speak_closed);
+    now += 500000LL;
+    render(frame, LED_VOICE_SPEAKING);
+    assert(last_avatar == s_robot_speak);
     charging = muted = true;
     render(frame, LED_VOICE_SPEAKING);
     assert(!strcmp(rows[2], "MIC: MUTED") && !s_is_sleeping);

@@ -66,6 +66,23 @@ static const char *network_short_label(int state) {
     }
 }
 
+static const char *radio_station_label(int station) {
+    switch (station % 100) {
+        case 0: return "FM: DONGAN 101";
+        case 1: return "FM: LOVE 103.7";
+        case 2: return "FM: STORY & FUN";
+        case 3: return "FM: CHINA VOICE";
+        case 4: return "FM: GROOVE LOFI";
+        case 5: return "FM: 007 LOUNGE";
+        case 6: return "FM: SG KISS 92";
+        case 7: return "FM: SG YES 933";
+        case 8: return "FM: CAPITAL 958";
+        case 9: return "FM: SG 987FM";
+        case 10: return "FM: UK KISS 100";
+        default: return "FM: HEART 102.7";
+    }
+}
+
 // 32x32 灵动机器人萌宠单色位图（共 128 字节，4 个 Page，每 Page 32 列）
 // 1. 待机/思考/空闲 (IDLE): 圆眼高光 + 浅笑
 static const uint8_t s_robot_idle[128] = {
@@ -179,6 +196,38 @@ static const uint8_t s_robot_love[128] = {
     0x21, 0x21, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x10, 0x08, 0x08, 0x07, 0x00, 0x00
 };
 
+// 8. 讲话闭嘴交替帧 (SPEAK_CLOSED): 弯弯笑眼 (^ ^) + 微笑合拢嘴
+static const uint8_t s_robot_speak_closed[128] = {
+    // Page 0
+    0x00, 0x00, 0x00, 0xf8, 0x04, 0x04, 0x84, 0xf8, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xf8, 0x84, 0x04, 0x04, 0xf8, 0x00, 0x00, 0x00,
+    // Page 1
+    0x00, 0x00, 0xfe, 0x00, 0x01, 0x01, 0x80, 0xc0, 0x60, 0x60, 0x60, 0xc0, 0x80, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x80, 0xc0, 0x60, 0x60, 0x60, 0xc0, 0x80, 0x01, 0x01, 0x00, 0xfe, 0x00, 0x00,
+    // Page 2
+    0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00,
+    // Page 3
+    0x00, 0x00, 0x07, 0x08, 0x08, 0x10, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x21, 0x21,
+    0x21, 0x21, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x10, 0x08, 0x08, 0x07, 0x00, 0x00
+};
+
+// 9. 待机自然眨眼帧 (BLINK): 闭眼微笑（无 Zzz）
+static const uint8_t s_robot_blink[128] = {
+    // Page 0
+    0x00, 0x00, 0x00, 0xf8, 0x04, 0x04, 0x84, 0xf8, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+    0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xf8, 0x84, 0x04, 0x04, 0xf8, 0x00, 0x00, 0x00,
+    // Page 1
+    0x00, 0x00, 0xfe, 0x00, 0x01, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x01, 0x00, 0xfe, 0x00, 0x00,
+    // Page 2
+    0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x41, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x41, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00,
+    // Page 3
+    0x00, 0x00, 0x07, 0x08, 0x08, 0x10, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x21, 0x21,
+    0x21, 0x21, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x10, 0x08, 0x08, 0x07, 0x00, 0x00
+};
+
 // 暂定电压估算刻度，非已标定的剩余容量；4215mV来自本机满电采样。
 // 只用于带 ~ 标记的显示，不参与充电、低电量阈值或关机控制。
 static int battery_percent_estimate(int mv) {
@@ -211,17 +260,20 @@ static void render(uint8_t *frame, led_voice_t voice) {
     bool paused = voice_playback_paused();
     bool halted = voice_halted();
     bool hungry = (!charging && !external && mv > 0 && mv < 3550);
+    voice_dial_mode_t dial = voice_dial_mode();
+    int radio = voice_radio_station();
 
     // 即使电台熄屏期间的活动已结束，也不丢失最后一次活动时间。
     int64_t activity = headpat_until - 3500000LL;
     if (activity > s_last_active_time) s_last_active_time = activity;
-    if (voice != LED_VOICE_IDLE || headpat || charging) {
+    if (voice != LED_VOICE_IDLE || headpat || charging || dial != VOICE_DIAL_VOLUME || radio >= 0) {
         s_last_active_time = now;
     }
     if (s_last_active_time == 0) s_last_active_time = now;
 
     bool sleeping = (voice == LED_VOICE_IDLE && state == NET_READY &&
                      !muted && !paused && !halted && !headpat && !charging && !hungry &&
+                     dial == VOICE_DIAL_VOLUME && radio < 0 &&
                      (now - s_last_active_time > 45000000LL));
     s_is_sleeping = sleeping;
 
@@ -231,17 +283,20 @@ static void render(uint8_t *frame, led_voice_t voice) {
     const char *hint = "S1 HOLD TO TALK";
     const char *shortcut = "S5 NEWS  S8 STORY";
 
-    if (muted) {
-        status = "MIC: MUTED";
-        hint = "S2 TO UNMUTE";
-        shortcut = "S2 UNMUTE";
-    } else if (halted) {
+    if (halted) {
         avatar = s_robot_hungry;
         status = "VOICE: STOPPED";
         hint = "CHECK FIRMWARE";
     } else if (voice == LED_VOICE_ERROR) {
         avatar = s_robot_hungry;
         led_status_oled_failure(&status, &hint);
+    } else if (dial == VOICE_DIAL_RADIO) {
+        status = radio_station_label(radio < 0 ? 0 : radio);
+        hint = muted ? "MUTED: DIAL OK" : "PRESS DIAL: OK";
+    } else if (muted) {
+        status = "MIC: MUTED";
+        hint = "S2 TO UNMUTE";
+        shortcut = "S2 UNMUTE";
     } else if (voice == LED_VOICE_REPLAY_WAIT) {
         status = "REPLAY: WAIT";
         hint = "AUTO RESUME";
@@ -268,10 +323,19 @@ static void render(uint8_t *frame, led_voice_t voice) {
         hint = "PLEASE WAIT";
         shortcut = "S4 CANCEL";
     } else if (voice == LED_VOICE_SPEAKING) {
-        avatar = s_robot_speak;
+        avatar = ((now / 500000LL) & 1) ? s_robot_speak_closed : s_robot_speak;
         status = "AUDIO: PLAYING";
         hint = "S4 TO PAUSE";
         shortcut = "S4 PAUSE  DIAL VOL";
+    } else if (radio >= 100) {
+        status = "RADIO: LOADING";
+        hint = radio_station_label(radio);
+        shortcut = "S6 STOP  S7 NEXT";
+    } else if (radio >= 0) {
+        avatar = ((now / 500000LL) & 1) ? s_robot_speak_closed : s_robot_speak;
+        status = radio_station_label(radio);
+        hint = "S6 TO STOP";
+        shortcut = "S6 STOP  S7 NEXT";
     } else if (state != NET_READY) {
         status = "AI: NOT READY";
         hint = state == NET_SETUP || state == NET_PAIR ? "OPEN MUSE APP" : "HOLD S5: STATUS";
@@ -288,7 +352,10 @@ static void render(uint8_t *frame, led_voice_t voice) {
     } else if (sleeping) {
         avatar = s_robot_sleep;
         status = "AI: SLEEPING";
-        hint = "TURN DIAL: WAKE";
+        hint = "VOICE/KEY WAKE";
+        shortcut = "WAKE: NIHAOXIAOYI";
+    } else if (((now / 500000LL) % 14) == 13) {
+        avatar = s_robot_blink;
     }
 
     oled_draw_icon32(frame, 0, 2, avatar);
@@ -306,7 +373,6 @@ static void render(uint8_t *frame, led_voice_t voice) {
 
     // 4. 下半部 (Page 5..7, 全屏宽 128 像素) 显示硬件参数与快捷键
     char line[24];
-    voice_dial_mode_t dial = voice_dial_mode();
     snprintf(line, sizeof(line), "%cVOL %3d%% %cBRI %3d%%",
              dial == VOICE_DIAL_VOLUME ? '>' : ' ', voice_volume(),
              dial == VOICE_DIAL_BRIGHTNESS ? '>' : ' ', easyinput_board_brightness());
@@ -377,6 +443,8 @@ static void oled_task(void *arg) {
     while (err == ESP_OK) {
         led_voice_t voice; bool dark;
         led_status_oled_snapshot(&voice, &dark);
+        // 仅选台时临时亮屏；普通播放继续遵循睡前电台的熄屏状态。
+        if (voice_dial_mode() == VOICE_DIAL_RADIO) dark = false;
         int percent = easyinput_board_brightness();
         // 沿用电台的实际熄灯状态，AI打断期间仍可显示；不改电台所有权。
         if (dark) {

@@ -132,7 +132,7 @@ if(CONFIG_HOMEHUB_LED_BACKEND_EASYINPUT_V2 AND CONFIG_HOMEHUB_VOICE)
 endif()
 if(CONFIG_HOMEHUB_RADIO)
     list(APPEND GADGET_SRCS "radio.c")
-    list(APPEND RADIO_EMBED "radio_assets/classical.pcm" "radio_assets/ambient.pcm")
+    list(APPEND RADIO_EMBED "radio_assets/stations.pcm")
 endif()
 
 idf_component_register(

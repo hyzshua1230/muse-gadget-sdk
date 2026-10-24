@@ -68,8 +68,183 @@ class RadioOwnership(unittest.TestCase):
         self.assertGreaterEqual(seconds * 16000 * 2, (timeout / 1000 + 0.1) * 16000 * 2)
         self.assertIn("MUSE_QWEN_ASR_CONNECT_TIMEOUT_MS * 1000LL", asr)
 
+    def test_station_flash_write_is_polled_from_internal_stack(self):
+        dial = block(self.voice, 'static void dial_task(')
+        self.assertIn('radio_poll_storage();', dial)
+        self.assertNotIn('radio_poll_storage();', block(self.radio, 'static void worker('))
+        preview = block(self.radio, 'bool radio_select_steps(')
+        self.assertNotIn('save_at', preview)
+        self.assertNotIn('config_set_str', preview)
+        init = block(self.radio, 'esp_err_t radio_init(')
+        self.assertIn('load_station()', init)
+        self.assertNotIn('set_enabled(true)', init)
+
 
 class RadioState(unittest.TestCase):
+    def test_station_prompt_assets_cover_all_stations(self):
+        source = (ROOT / 'main/radio.c').read_text(encoding='utf-8')
+        count = int(re.search(r'urls\[(\d+)\]\[2\]', source)[1])
+        header = (ROOT / 'main/radio_assets/stations.h').read_text(encoding='utf-8')
+        offsets = [int(x) for x in re.findall(r'\d+', header.split('{', 1)[1])]
+        pcm = (ROOT / 'main/radio_assets/stations.pcm').read_bytes()
+        rate = int(re.search(r'#define RADIO_PROMPT_RATE (\d+)', header)[1])
+        self.assertEqual(rate, 8000)
+        self.assertEqual(len(offsets), count + 1)
+        self.assertEqual(offsets[0], 0)
+        self.assertEqual(offsets[-1] * 2, len(pcm))
+        for start, end in zip(offsets, offsets[1:]):
+            self.assertGreater(end, start)
+            self.assertLessEqual((end - start) / rate, 4.2)
+            self.assertNotEqual(set(pcm[start * 2:end * 2]), {0})
+
+    def test_preview_uses_candidate_and_cancels_expired_prompt(self):
+        cc = shlex.split(os.environ.get('CC', 'cc'))
+        if not cc or shutil.which(cc[0]) is None:
+            self.skipTest('主机C编译器不可用，台名预览执行测试未验证')
+        source = (ROOT / 'main/radio.c').read_text(encoding='utf-8')
+        state = source[source.index('typedef struct {'):source.index('static portMUX_TYPE')]
+        harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include "radio_assets/stations.h"
+#include <limits.h>
+#define PROMPT_REPEAT (48000 / RADIO_PROMPT_RATE)
+#define portENTER_CRITICAL(lock) ((void)0)
+#define portEXIT_CRITICAL(lock) ((void)0)
+static int64_t now;
+static int64_t esp_timer_get_time(void) { return now; }
+static uint8_t stations_start[2103360];
+typedef struct {
+    unsigned preview;
+    const int16_t *prompt;
+    size_t prompt_pos, prompt_samples;
+    int32_t out[192*2];
+    float duck;
+} audio_t;
+typedef int esp_err_t;
+static int32_t observed[192*2];
+static esp_err_t voice_board_speaker_write(const int32_t *frames, size_t count) {
+    for (size_t i = 0; i < count * 2; ++i) observed[i] = frames[i];
+    return 0;
+}
+'''
+        harness += state + block(source, 'static state_t snapshot(') + block(source, 'static void preview_update(') + block(source, 'static esp_err_t output(')
+        harness += r'''
+int main(void) {
+    audio_t audio = {0};
+    s.selecting = true; s.preview = 1; s.preview_at = 800000; s.select_until = 5000000;
+    now = 799999; preview_update(&audio); assert(!audio.prompt);
+    now = 800000;
+    for (int i = 0; i < 12; ++i) {
+        s.candidate = i; ++s.preview; preview_update(&audio);
+        assert(audio.prompt == (const int16_t *)stations_start + radio_prompt_offsets[i]);
+        assert(audio.prompt_samples == radio_prompt_offsets[i+1] - radio_prompt_offsets[i]);
+        assert(audio.prompt_pos == 0);
+    }
+    audio.prompt_pos = 42; preview_update(&audio); assert(audio.prompt_pos == 42);
+    ++s.preview; s.preview_at = now + 800000; preview_update(&audio); assert(!audio.prompt);
+    now = s.select_until; preview_update(&audio); assert(!audio.prompt && !s.selecting);
+    const int16_t tiny[] = {100, -100};
+    audio.prompt = tiny; audio.prompt_samples = 2; audio.prompt_pos = 0;
+    assert(PROMPT_REPEAT == 6);
+    assert(output(&audio, 12, 1, true) == 0);
+    for (int i = 0; i < 24; ++i) assert(observed[i] == (i < 12 ? 6553600 : -6553600));
+    assert(audio.prompt_pos == 12);
+    return 0;
+}
+'''
+        out = Path(tempfile.mkdtemp(prefix='radio-preview-', dir=ROOT / 'tmp/easyinput'))
+        cfile, exe = out / 'preview.c', out / 'preview.exe'
+        cfile.write_text(harness, encoding='utf-8')
+        subprocess.run(cc + ['-std=c11', '-Wall', '-Werror', '-I', str(ROOT / 'main'),
+                            str(cfile), '-o', str(exe)], check=True, capture_output=True, text=True)
+        subprocess.run([str(exe)], check=True, capture_output=True, timeout=10)
+
+    def test_station_persistence_and_debounce(self):
+        cc = shlex.split(os.environ.get('CC', 'cc'))
+        if not cc or shutil.which(cc[0]) is None:
+            self.skipTest('主机C编译器不可用，频道持久化执行测试未验证')
+        source = (ROOT / 'main/radio.c').read_text(encoding='utf-8')
+        state = source[source.index('typedef struct {'):source.index('static portMUX_TYPE')]
+        harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define STATION_COUNT 12
+#define portENTER_CRITICAL(lock) ((void)0)
+#define portEXIT_CRITICAL(lock) ((void)0)
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+static int64_t now;
+static int64_t esp_timer_get_time(void) { return now; }
+static char stored[16];
+static int writes;
+static bool missing, fail_write, change_during_write;
+static bool config_get_str(const char *key, char *value, size_t cap) {
+    assert(!strcmp(key, "radio_station"));
+    if (missing || strlen(stored) >= cap) return false;
+    strcpy(value, stored); return true;
+}
+void radio_next(void);
+static bool config_set_str(const char *key, const char *value) {
+    assert(!strcmp(key, "radio_station")); ++writes;
+    if (fail_write) return false;
+    strcpy(stored, value);
+    if (change_during_write) { change_during_write = false; radio_next(); }
+    return true;
+}
+'''
+        harness += state + '\n'.join(block(source, name) for name in (
+            'static state_t snapshot(', 'static void select_station_locked(',
+            'static int load_station(', 'void radio_poll_storage(',
+            'void radio_next(', 'void radio_select_mode(', 'bool radio_select_steps(',
+            'bool radio_select_confirm(',
+        ))
+        harness += r'''
+int main(void) {
+    missing = true; assert(load_station() == 0); missing = false;
+    const char *bad[] = {"", "-1", "12", "999", "1x", "123456789"};
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); ++i) {
+        strcpy(stored, bad[i]); assert(load_station() == 0);
+    }
+    for (int i = 0; i < 12; ++i) {
+        snprintf(stored, sizeof(stored), "%d", i); assert(load_station() == i);
+    }
+    s = (state_t){.ready = true};
+    radio_next(); now = 1999999; radio_poll_storage(); assert(writes == 0);
+    now = 2000000; radio_poll_storage(); assert(writes == 1 && !strcmp(stored, "1"));
+    radio_next(); now = 3000000; radio_next();
+    now = 4999999; radio_poll_storage(); assert(writes == 1);
+    now = 5000000; radio_poll_storage(); assert(writes == 2 && !strcmp(stored, "3"));
+    radio_select_mode(); radio_select_steps(4);
+    now += 5000001; assert(!radio_select_confirm());
+    radio_poll_storage(); assert(writes == 2 && s.station == 3);
+    radio_select_mode(); radio_select_steps(4); assert(radio_select_confirm());
+    now += 2000000; radio_poll_storage(); assert(writes == 3 && !strcmp(stored, "7"));
+    radio_next(); radio_select_mode(); radio_select_steps(-1); radio_select_confirm();
+    now += 2000000; radio_poll_storage(); assert(writes == 3);
+    fail_write = true; radio_next(); now += 2000000; radio_poll_storage();
+    assert(writes == 4 && !strcmp(stored, "7") && s.saved_station == 7);
+    fail_write = false; radio_next(); now += 2000000; radio_poll_storage();
+    assert(writes == 5 && !strcmp(stored, "9"));
+    change_during_write = true; radio_next(); now += 2000000; radio_poll_storage();
+    assert(!strcmp(stored, "10") && s.station == 11 && s.save_at > now);
+    now += 2000000; radio_poll_storage(); assert(!strcmp(stored, "11"));
+    assert(!s.enabled);
+    return 0;
+}
+'''
+        out = Path(tempfile.mkdtemp(prefix='radio-storage-', dir=ROOT / 'tmp/easyinput'))
+        cfile, exe = out / 'storage.c', out / 'storage.exe'
+        cfile.write_text(harness, encoding='utf-8')
+        subprocess.run(cc + ['-std=c11', '-Wall', '-Werror', str(cfile), '-o', str(exe)],
+                       check=True, capture_output=True, text=True)
+        subprocess.run([str(exe)], check=True, capture_output=True, timeout=10)
+
     def test_actual_state_functions_with_fake_clock(self):
         cc = shlex.split(os.environ.get("CC", "cc"))
         if not cc or shutil.which(cc[0]) is None:
@@ -77,7 +252,7 @@ class RadioState(unittest.TestCase):
         source = (ROOT / "main/radio.c").read_text(encoding="utf-8")
         state = source[source.index("typedef struct {"):source.index("static portMUX_TYPE")]
         functions = "\n".join(block(source, name) for name in (
-            "static state_t snapshot(", "bool radio_enabled(", "static void set_enabled(",
+            "static state_t snapshot(", "bool radio_enabled(", "static void select_station_locked(", "static void set_enabled(",
             "void radio_toggle(", "void radio_next(", "void radio_select_mode(",
             "bool radio_select_steps(", "bool radio_select_confirm(", "bool radio_pause(",
             "static bool current(unsigned epoch) {",
@@ -90,6 +265,7 @@ class RadioState(unittest.TestCase):
 #define portENTER_CRITICAL(lock) ((void)0)
 #define portEXIT_CRITICAL(lock) ((void)0)
 #define pdMS_TO_TICKS(ms) (ms)
+#define STATION_COUNT 12
 static int64_t now;
 static bool release_output;
 static int64_t esp_timer_get_time(void) { return now; }
@@ -124,7 +300,7 @@ int main(void) {
     assert(!s.blocked && s.deadline == deadline);
     s.output = false;
     radio_select_mode();
-    assert(radio_select_steps(1) && s.candidate == 0);
+    assert(radio_select_steps(11) && s.candidate == 0);
     assert(radio_select_confirm() && s.station == 0);
     assert(s.deadline == deadline);
     radio_select_mode();

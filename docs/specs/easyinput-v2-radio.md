@@ -1,6 +1,42 @@
 # EasyInput V2 睡前音乐电台规格草案
 
-状态：交互已确认；用户选择寻找其它国内MP3音乐台、保留原解码方案，默认候选采用已通过电脑短时检查的上海经典947，第二台为SomaFM Drone Zone。已接入代码并编译成功，未烧录，现场功能待验收。
+## 2026-10-24：静音选台、频道记忆及8kHz台名（已烧录，验收中）
+
+用户同意按评审建议推进。静音选台窗口显示候选台名，同时显示MUTED标记；选台不解除静音，原任务停止/错误提示不被该窗口覆盖，窗口退出恢复静音提示。频道仅在S7短按、旋钮确认或明确语音选台后更新；候选旋转/超时取消不保存。停止切台约2秒后，由现有内部RAM栈的dial任务调用config_store保存radio_station，连续切台合并写入；开机校验0～11后恢复频道，但不自动播放，缺失/无效值仍采用原默认第0台。恢复配网沿用config_store的设备偏好保留规则，不新增整片擦除或重置策略。
+
+台名从16kHz单声道PCM低通后降采样至8kHz，输出仍走48kHz扬声器通路；重采样比例由3改为6，避免语速/音调改变。只转换本地素材，不下载编码器、不新增MP3提示音解码器、不改变直播音乐解码。验收目标：静音下候选台名可见且无声、退出恢复静音提示；预览取消不写NVS、连续切台2秒合并保存、无效索引安全忽略、重启恢复且不开播；台名时长不变且素材减半；现有S6/S7/旋钮和AI所有权保持。
+
+首次联网失败已有app.c应用层退避恢复，不叠加wifi_mgr重连策略。频道写入失败仅日志报告，不新增自动重试；旧写入结束时不清除并发新选台的保存期限。S2、电台/AI共存与频道断电恢复的实机结果不能预先标通过。
+
+执行记录：更新OLED显示优先级、radio.c/h持久化接口及voice.c的dial任务调用；不在PSRAM栈电台任务写NVS，不为候选台保存。新增测试覆盖非法/缺失索引、2秒合并、预览取消、回到已存频道不重复写、写入失败及并发切台，以及静音选台/错误优先级和8kHz样本按6帧重复播放。定向15项9通过6跳过（缺主机C编译器，实际C状态/渲染/输出执行未验证）；差异格式检查通过。12段新旧样本时长逐一核对一致，素材从1051680降至525840字节，SHA256为`d8adf977df0f3f834fb93244348400ea85b6bd219b524da1b2fbf2e709eb0f0c`。转换采用本地63抽头低通，无新编码器/依赖或云端调用；原16kHz合集备份在tmp/easyinput/stations-16k-before-conversion.pcm。
+
+沿用原ESP-IDF6.0.1、配置与受限官方元数据环境执行原构建命令，日志tmp/easyinput/radio-memory-8k-build.log，退出0，无编译器warning/error匹配。应用3149824字节，4MiB槽余25%，SHA256=`ecadb3fc5d641d914b3ddb22af3fa7c387fe5761b050bc5c13987ccdc14b60e6`；模型仍b099ae，与上一版一致。原已验收应用7cb226的回滚副本在tmp/easyinput/radio-memory-before-7cb226273243.bin。
+
+用户另行确认烧录并验证后，鲜扫COM6及USB序列C4:9E:7E:07:9F:D8、实读原ESP32-S3 MAC，读回0x10000起4096字节，确认前3072与本地分区一致、余1024全0xff，再核USB与新应用SHA256。仅write-flash 0x20000新应用，退出0且设备数据哈希校验通过；不写分区表、模型、NVS/OTA状态，不修改系统、网络或全局环境。烧录日志tmp/easyinput/radio-memory-8k-flash.log。
+
+复扫设备后开启按USB身份自动重连的600秒脱敏采集`capture-reconnect.py C4:9E:7E:07:9F:D8 600 tmp/easyinput/radio-memory-8k-validation.log`，用于后续人工关机重启的保存验收。已通知先测S2静音选台、解除静音台名试听、确认频道并停止3秒，先不关机。未主动调用收费语音。当前板上及本地均为ecadb3版本，未提交推送。
+
+用户对上述测试反馈“工作正常”，记录静音选台候选名称/静音标记可见且无声、解除静音后台名清楚/语速正常通过。日志在32701ms/72881ms显示mute on/off，81089ms记录station saved=2（北京文艺广播）；随后一次新启动921ms记录station restored=2; playback off，13229～13329ms收到S6，14447ms同一station=2解码44100Hz/64kbps/双声道，表明保存与跨启动读取、手动开启同台的链路已执行。已询问该次重启是否用户主动正常关开机，以及开机是否未自动播放；尚待确认，不把跨启动日志直接升级为人工断电验收通过，也不据此推断重启原因。样本未匹配panic或display stopped；AI共存及长测仍未覆盖。
+
+用户随后明确确认该次为主动关机再开机、开机后未自动播放且按S6后才出声。结合保存/恢复/同台解码日志，记录本轮频道断电记忆及不开机自播验收通过，无需重复断电。已询问一次S1打断电台、云端短回复后恢复同台的费用许可，当前等待答复，尚未通知触发；不沿用历史已消耗的单次云端许可。60分钟长测与全部音源仍待专项。
+
+## 2026-10-24：最新评审修复（已烧录，本轮人工功能验收通过）
+
+用户授权修复并刷机验证。保留工作区已有12台音源、S6开关/S7切台及长按S7选台，修复OLED误写的“S7停止”为“S6停止”，底部提示“S6 STOP  S7 NEXT”。恢复播放时跟随radio_dark熄屏，仅旋钮选台模式临时亮屏，退出/超时后重新遵循播放熄屏状态。原有AI打断、60分钟定时、灯条、亮度曲线与保存策略不变。
+
+台名预览恢复为候选台停转800ms后播放。复用已授权的本机Microsoft Huihui Desktop中文声音，生成12段16kHz/16bit单声道提示，合并为main/radio_assets/stations.pcm（1051680字节，SHA256 dd1fc858796a5321e3a8c5a7cd200a5a4a784392aeb5a60c2fccc53ebd0c3737），stations.h存储13个样本边界；编译期检查提示数量与音源数量一致。只嵌入新合集，旧两台素材保留，不读取密钥、不调用云端TTS；生成原件保存在已忽略的tmp/easyinput/radio-prompts-review-fix目录，无新增依赖或系统修改。
+
+OLED眨眼回归测试改为单调推进时间，在摸头效果到期后再检查眨眼，避免时间倒退导致爱心覆盖。台名测试核对12段边界、时长与非空数据，并补充候选台预览/超时停止的C执行用例。实际执行test_oled_text.py、test_radio_lifecycle.py、test_easyinput_brightness.py合计13项：8项通过，5项因缺少主机C编译器跳过；不能宣称C运行验证通过。首次新增熄屏静态断言误匹配logged_dark变量，已限定独立变量名后同命令重跑通过，未更换依赖或控制策略。git diff --check通过。
+
+沿用ESP-IDF 6.0.1、build-easyinput-v2-soft-aes-s3和原本地配置，通过已审查metadata-python仅允许components.espressif.com、components-file.espressif.com只读元数据，禁止组件下载/升级/清理。原应用按哈希备份为tmp/easyinput/review-fix-before-<哈希前12位>.bin；实际构建命令为`python "$env:IDF_PATH/tools/idf.py" -B build-easyinput-v2-soft-aes-s3 -D SDKCONFIG=tmp/easyinput/sdkconfig.soft-aes-s3 build`，日志tmp/easyinput/radio-oled-review-fix-build.log。退出0，无编译器warning/error匹配；应用3674112字节，4MiB应用分区余12%，SHA256 `7cb226273243a92782a64d453d25dbb1aa035c538b83e23dd57f6be8012edebe`。模型仍为`b099ae230940f66690f936973eb0ae3e9cf3210a9c310527a186753f42e6d007`，未更改分区或模型。
+
+用户本轮“优化，并刷机验证”已授权烧录。重新扫描COM6并实读ESP32-S3及MAC `c4:9e:7e:07:9f:d8`；读取0x10000起4096字节分区区，前3072字节与本地一致，余1024字节均0xff。再次核验USB序列号和上述应用哈希后，仅执行`python -m esptool --chip esp32s3 -p COM6 -b 460800 --before no-reset --after hard-reset write-flash --flash-mode dio --flash-freq 80m --flash-size keep 0x20000 build-easyinput-v2-soft-aes-s3/muse-gadget.bin`。退出0，设备数据哈希校验通过，日志tmp/easyinput/radio-oled-review-fix-flash.log。未写NVS、模型、分区表、启动程序或OTA状态，不改变配网、音量、亮度及DNS设置。
+
+复扫同一USB身份后开启300秒脱敏采集`capture-asr.py COM6 300 tmp/easyinput/radio-oled-review-fix-validation.log`，早期样本显示网络state=4、语音phase=7/error=0/ready=1，未匹配panic或display stopped。已请用户验证S6开关与播放熄屏、长按S7选台亮屏及不同台名播报、旋钮确认后熄屏、S7短按切台；实屏/声音结果仍待反馈，S2静音、全部12台连通性与长时间播放也未在本轮完整验收。不主动调用收费语音，不以编译/写入成功代替现场功能通过。临时产物留在Workspace，未清理、提交或推送。
+
+用户随后对本轮三项操作反馈“功能正常”：确认S6开关/播放熄屏/关闭恢复显示、长按S7选台亮屏并播报候选台名/旋钮确认后恢复熄屏，以及S7短按切台通过。日志确认多个台成功解码（station=5为44100Hz/128kbps/双声道，station=6～8为44100Hz/96kbps/双声道），播放时0xae熄屏、切换时0xaf恢复均返回ESP_OK；上述切台结束样本cancelled=1，未匹配panic、display stopped或四次重试耗尽。结合用户观察，记录本轮修复功能验收通过，不扩展为全部12台、S2静音、AI共存或60分钟长测均已通过。本次仅核对现有日志并更新本文，没有新增编译、烧录、云端调用或提交推送。
+
+以下为首版历史规格及执行记录：最初默认候选为上海经典947，第二台为SomaFM Drone Zone；当前12台实现及最新验收以上节为准。
 
 ## 1. 已确认范围
 
