@@ -33,6 +33,7 @@ void voice_init(void);
 typedef enum { VOICE_DIAL_VOLUME, VOICE_DIAL_BRIGHTNESS, VOICE_DIAL_RADIO } voice_dial_mode_t;
 voice_dial_mode_t voice_dial_mode(void);
 int voice_radio_station(void);
+void voice_radio_telemetry(int *bitrate_kbps, int *remain_min, int *vu_level);
 int voice_volume(void);
 bool voice_playback_paused(void);
 bool voice_halted(void);

@@ -46,8 +46,8 @@ _Static_assert(sizeof(radio_prompt_offsets) / sizeof(radio_prompt_offsets[0]) ==
 typedef struct {
     bool enabled, blocked, output, selecting, ready;
     unsigned epoch, preview;
-    int station, candidate, saved_station;
-    int64_t deadline, select_until, preview_at, save_at;
+    int station, candidate, saved_station, bitrate_kbps, vu_level;
+    int64_t deadline, select_until, preview_at, save_at, vu_decay_at;
 } state_t;
 static state_t s;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -61,13 +61,45 @@ int radio_station(void) {
     if (!st.enabled || st.blocked) return -1;
     return st.output ? st.station : (100 + st.station);
 }
+void radio_get_telemetry(radio_telemetry_t *out) {
+    if (!out) return;
+    state_t st = snapshot();
+    int64_t now = esp_timer_get_time();
+    bool selecting = st.selecting && now < st.select_until;
+    bool active = (st.enabled && !st.blocked) || selecting;
+    int idx = selecting ? st.candidate : st.station;
+    if (idx < 0 || idx >= STATION_COUNT) idx = 0;
+    int remain = 60;
+    if (st.enabled && st.deadline > 0) {
+        int64_t left_us = st.deadline - now;
+        if (left_us <= 0) remain = 1;
+        else {
+            remain = (int)((left_us + 59999999LL) / 60000000LL);
+            if (remain < 1) remain = 1;
+            if (remain > 60) remain = 60;
+        }
+    }
+    int vu = (st.enabled && !st.blocked && st.output) ? st.vu_level : 0;
+    if (vu < 0) vu = 0;
+    if (vu > 10) vu = 10;
+    *out = (radio_telemetry_t){
+        .active = active,
+        .playing = st.enabled && !st.blocked && st.output,
+        .selecting = selecting,
+        .station_index = (uint8_t)idx,
+        .station_count = STATION_COUNT,
+        .bitrate_kbps = (uint16_t)(st.bitrate_kbps > 0 ? st.bitrate_kbps : 0),
+        .remain_min = (uint8_t)remain,
+        .vu_level = (uint8_t)vu,
+    };
+}
 // 调用方持有s_lock；候选预览不走此路径，也不触发NVS写入。
 static void select_station_locked(int station) {
     if (s.station != station) {
         s.station = station;
         s.save_at = esp_timer_get_time() + 2000000;
     }
-    ++s.epoch; s.selecting = false;
+    ++s.epoch; s.selecting = false; s.bitrate_kbps = 0; s.vu_level = 0;
 }
 static int load_station(void) {
     char value[4];
@@ -102,6 +134,7 @@ static void set_enabled(bool enabled) {
     portENTER_CRITICAL(&s_lock);
     if (s.ready && s.enabled != enabled) {
         s.enabled = enabled; ++s.epoch; s.selecting = false;
+        s.bitrate_kbps = 0; s.vu_level = 0;
         if (enabled) s.deadline = 0;
     }
     portEXIT_CRITICAL(&s_lock);
@@ -110,6 +143,7 @@ void radio_toggle(void) {
     portENTER_CRITICAL(&s_lock);
     if (s.ready) {
         s.enabled=!s.enabled; ++s.epoch; s.selecting=false;
+        s.bitrate_kbps=0; s.vu_level=0;
         if (s.enabled) s.deadline=0;
     }
     portEXIT_CRITICAL(&s_lock);
@@ -275,6 +309,7 @@ static float gain_now(int64_t started) {
     return gain;
 }
 static esp_err_t output(audio_t *audio, size_t count, float gain, bool prompts) {
+    int32_t peak = 0;
     for (size_t i=0;i<count;++i) {
         int32_t prompt = 0;
         bool speaking = prompts && audio->prompt && audio->prompt_pos/PROMPT_REPEAT < audio->prompt_samples;
@@ -285,9 +320,26 @@ static esp_err_t output(audio_t *audio, size_t count, float gain, bool prompts) 
         audio->duck += difference>1.0f/960 ? 1.0f/960 : difference < -1.0f/960 ? -1.0f/960 : difference;
         for (int ch=0;ch<2;++ch) {
             int64_t value = (int64_t)(audio->out[2*i+ch] * gain * audio->duck) + prompt;
-            audio->out[2*i+ch] = value > INT32_MAX ? INT32_MAX : value < INT32_MIN ? INT32_MIN : value;
+            int32_t sample = value > INT32_MAX ? INT32_MAX : value < INT32_MIN ? INT32_MIN : (int32_t)value;
+            audio->out[2*i+ch] = sample;
+            if ((i & 3) == 0) {
+                int32_t mag = sample < 0 ? -(sample >> 16) : (sample >> 16);
+                if (mag > peak) peak = mag;
+            }
         }
     }
+    int level = peak > 0 ? (peak + 1400) / 1800 : 0;
+    if (level > 10) level = 10;
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (level >= s.vu_level) {
+        s.vu_level = level;
+        s.vu_decay_at = now + 40000;
+    } else if (s.vu_level > 0 && now >= s.vu_decay_at) {
+        --s.vu_level;
+        s.vu_decay_at = now + 40000;
+    }
+    portEXIT_CRITICAL(&s_lock);
     return voice_board_speaker_write(audio->out,count);
 }
 static bool current(unsigned epoch) {
@@ -393,7 +445,7 @@ static bool play(audio_t *audio, state_t st, int url_index) {
         if (!sounding) {
             portENTER_CRITICAL(&s_lock);
             bool allowed=s.enabled && !s.blocked && s.epoch==st.epoch;
-            if (allowed) s.output=true;
+            if (allowed) { s.output=true; s.bitrate_kbps=info.bitrate_kbps; }
             portEXIT_CRITICAL(&s_lock);
             if (!allowed) goto finished;
             sounding = true; started = progress; voice_board_amp(true);
@@ -456,7 +508,7 @@ finished:
         memset(audio->out,0,sizeof(audio->out)); voice_board_speaker_write(audio->out,192);
         vTaskDelay(pdMS_TO_TICKS(40)); voice_board_amp(false);
         led_status_radio_dark(false);
-        portENTER_CRITICAL(&s_lock); s.output=false; portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); s.output=false; s.vu_level=0; s.bitrate_kbps=0; portEXIT_CRITICAL(&s_lock);
     }
 close:
     atomic_store(&stream.stop,true);
@@ -503,7 +555,7 @@ static void worker(void *arg) {
         }
         if (st.epoch != epoch) { epoch=st.epoch; failures=0; }
         bool ok = play(audio,st,failures ? 1 : 0);
-        portENTER_CRITICAL(&s_lock); s.output=false; portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); s.output=false; s.vu_level=0; s.bitrate_kbps=0; portEXIT_CRITICAL(&s_lock);
         if (ok || !current(st.epoch)) continue;
         if (++failures > 4) {
             portENTER_CRITICAL(&s_lock);

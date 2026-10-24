@@ -176,6 +176,19 @@ int voice_radio_station(void) {
     return -1;
 #endif
 }
+void voice_radio_telemetry(int *bitrate_kbps, int *remain_min, int *vu_level) {
+#if CONFIG_HOMEHUB_RADIO
+    radio_telemetry_t tel = {0};
+    radio_get_telemetry(&tel);
+    if (bitrate_kbps) *bitrate_kbps = tel.bitrate_kbps;
+    if (remain_min) *remain_min = tel.remain_min;
+    if (vu_level) *vu_level = tel.vu_level;
+#else
+    if (bitrate_kbps) *bitrate_kbps = 0;
+    if (remain_min) *remain_min = 0;
+    if (vu_level) *vu_level = 0;
+#endif
+}
 int voice_volume(void) { return atomic_load(&s_volume); }
 bool voice_playback_paused(void) { return atomic_load(&s_paused); }
 bool voice_halted(void) { return atomic_load(&s_voice_diag_phase) == VOICE_DIAG_HALTED; }
@@ -276,6 +289,9 @@ static void dial_task(void *arg) {
                 atomic_load(&s_paused), (unsigned)uxQueueMessagesWaiting(s_events));
         }
         if (atomic_exchange(&s_brightness_clicks, 0) & 1) {
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+            easyinput_oled_headpat();
+#endif
 #if CONFIG_HOMEHUB_RADIO
             if (radio_select_confirm()) brightness_mode = false;
             else
@@ -298,6 +314,9 @@ static void dial_task(void *arg) {
 #endif
 #if CONFIG_HOMEHUB_RADIO
         if (radio_select_steps(steps)) {
+#if CONFIG_HOMEHUB_EASYINPUT_OLED
+            if (steps) easyinput_oled_headpat();
+#endif
             steps = 0; brightness_mode = false;
 #if CONFIG_HOMEHUB_EASYINPUT_OLED
             dial_mode = VOICE_DIAL_RADIO;

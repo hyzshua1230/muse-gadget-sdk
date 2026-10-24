@@ -28,7 +28,10 @@ static i2c_master_dev_handle_t s_device;
 static atomic_llong s_headpat_until;
 // 仅由 OLED 任务维护；其他任务通过原子活动时间通知。
 static int64_t s_last_active_time;
+static int s_last_radio = -1;
+static bool s_last_muted;
 static bool s_is_sleeping;
+static bool s_radio_dim;
 
 void easyinput_oled_headpat(void) {
     int64_t now = esp_timer_get_time();
@@ -263,13 +266,23 @@ static void render(uint8_t *frame, led_voice_t voice) {
     voice_dial_mode_t dial = voice_dial_mode();
     int radio = voice_radio_station();
 
-    // 即使电台熄屏期间的活动已结束，也不丢失最后一次活动时间。
+    // 即使电台微光期间的活动已结束，也不丢失最后一次活动时间。
     int64_t activity = headpat_until - 3500000LL;
     if (activity > s_last_active_time) s_last_active_time = activity;
-    if (voice != LED_VOICE_IDLE || headpat || charging || dial != VOICE_DIAL_VOLUME || radio >= 0) {
+    if (radio != s_last_radio || muted != s_last_muted) {
+        s_last_radio = radio;
+        s_last_muted = muted;
+        s_last_active_time = now;
+    }
+    if (voice != LED_VOICE_IDLE || headpat || dial != VOICE_DIAL_VOLUME ||
+        radio >= 100 || (charging && radio < 0)) {
         s_last_active_time = now;
     }
     if (s_last_active_time == 0) s_last_active_time = now;
+
+    s_radio_dim = (voice == LED_VOICE_IDLE && !halted && !headpat &&
+                   dial == VOICE_DIAL_VOLUME && radio >= 0 && radio < 100 &&
+                   (now - s_last_active_time > 15000000LL));
 
     bool sleeping = (voice == LED_VOICE_IDLE && state == NET_READY &&
                      !muted && !paused && !halted && !headpat && !charging && !hungry &&
@@ -279,9 +292,13 @@ static void render(uint8_t *frame, led_voice_t voice) {
 
     // 功能状态优先于桌宠心情；右侧每行最多 15 个 ASCII 字符。
     const uint8_t *avatar = s_robot_idle;
+    char title[16] = "TinyPal";
+    char top_line[16];
+    snprintf(top_line, sizeof(top_line), "%s", network_short_label(state));
     const char *status = "AI: READY";
     const char *hint = "S1 HOLD TO TALK";
     const char *shortcut = "S5 NEWS  S8 STORY";
+    char vu_line[16];
 
     if (halted) {
         avatar = s_robot_hungry;
@@ -291,6 +308,10 @@ static void render(uint8_t *frame, led_voice_t voice) {
         avatar = s_robot_hungry;
         led_status_oled_failure(&status, &hint);
     } else if (dial == VOICE_DIAL_RADIO) {
+        int ch = ((radio < 0 ? 0 : radio) % 100) + 1;
+        snprintf(title, sizeof(title), "TinyPal CH%02d/12", ch < 1 ? 1 : ch > 12 ? 12 : ch);
+        snprintf(top_line, sizeof(top_line), "%s", "PICK STATION");
+        avatar = s_robot_listen;
         status = radio_station_label(radio < 0 ? 0 : radio);
         hint = muted ? "MUTED: DIAL OK" : "PRESS DIAL: OK";
     } else if (muted) {
@@ -328,14 +349,38 @@ static void render(uint8_t *frame, led_voice_t voice) {
         hint = "S4 TO PAUSE";
         shortcut = "S4 PAUSE  DIAL VOL";
     } else if (radio >= 100) {
+        int ch = (radio % 100) + 1;
+        snprintf(title, sizeof(title), "TinyPal CH%02d/12", ch < 1 ? 1 : ch > 12 ? 12 : ch);
+        avatar = s_robot_listen;
         status = "RADIO: LOADING";
         hint = radio_station_label(radio);
-        shortcut = "S6 STOP  S7 NEXT";
+        shortcut = "S6 STOP  S7 NEXT/SEL";
     } else if (radio >= 0) {
-        avatar = ((now / 500000LL) & 1) ? s_robot_speak_closed : s_robot_speak;
+        int ch = (radio % 100) + 1;
+        snprintf(title, sizeof(title), "TinyPal CH%02d/12", ch < 1 ? 1 : ch > 12 ? 12 : ch);
+        int bitrate_kbps = 0, remain_min = 60, vu_level = 0;
+        voice_radio_telemetry(&bitrate_kbps, &remain_min, &vu_level);
+        if (remain_min < 1) remain_min = 1;
+        if (remain_min > 99) remain_min = 99;
+        if (bitrate_kbps > 0 && bitrate_kbps <= 999) {
+            snprintf(top_line, sizeof(top_line), "ON AIR %3dk %2dm", bitrate_kbps, remain_min);
+        } else {
+            snprintf(top_line, sizeof(top_line), "ON AIR LIVE %2dm", remain_min);
+        }
         status = radio_station_label(radio);
-        hint = "S6 TO STOP";
-        shortcut = "S6 STOP  S7 NEXT";
+        if (s_radio_dim) {
+            avatar = s_robot_idle;
+            hint = "DIM: DIAL WAKE";
+        } else {
+            avatar = ((now / 250000LL) & 1) ? s_robot_speak_closed : s_robot_speak;
+            if (vu_level < 0) vu_level = 0;
+            if (vu_level > 10) vu_level = 10;
+            memcpy(vu_line, "VU ", 3);
+            for (int i = 0; i < 10; ++i) vu_line[3 + i] = (i < vu_level) ? '|' : '.';
+            vu_line[13] = '\0';
+            hint = vu_line;
+        }
+        shortcut = "S6 STOP  S7 NEXT/SEL";
     } else if (state != NET_READY) {
         status = "AI: NOT READY";
         hint = state == NET_SETUP || state == NET_PAIR ? "OPEN MUSE APP" : "HOLD S5: STATUS";
@@ -361,8 +406,8 @@ static void render(uint8_t *frame, led_voice_t voice) {
     oled_draw_icon32(frame, 0, 2, avatar);
 
     // 2. 右侧核心状态 (Page 0..3)
-    oled_text_at(frame, 0, 36, "TinyPal");
-    oled_text_at(frame, 1, 36, network_short_label(state));
+    oled_text_at(frame, 0, 36, title);
+    oled_text_at(frame, 1, 36, top_line);
     oled_text_at(frame, 2, 36, status);
     oled_text_at(frame, 3, 36, hint);
 
@@ -439,55 +484,45 @@ static void oled_task(void *arg) {
     unsigned contrast = 0;
     unsigned precharge = 0;
     int logged_percent = -1;
-    bool logged_sleeping = false, logged_dark = false;
+    bool logged_low_glow = false, logged_dark = false;
     while (err == ESP_OK) {
         led_voice_t voice; bool dark;
         led_status_oled_snapshot(&voice, &dark);
-        // 仅选台时临时亮屏；普通播放继续遵循睡前电台的熄屏状态。
-        if (voice_dial_mode() == VOICE_DIAL_RADIO) dark = false;
         int percent = easyinput_board_brightness();
-        // 沿用电台的实际熄灯状态，AI打断期间仍可显示；不改电台所有权。
-        if (dark) {
-            if (on) {
-                const uint8_t off[] = {0xae}; err = commands(off, sizeof(off)); on = false;
-                ESP_LOGI(TAG, "power diag: command=0xae result=%s", esp_err_to_name(err));
-            }
-            if (percent != logged_percent || !logged_dark)
-                ESP_LOGI(TAG, "brightness diag: requested=%d dark=1 action=deferred", percent);
-        } else {
-            render(frames, voice);
-            unsigned level = s_is_sleeping ? 1 : (1 + easyinput_brightness_scale(63, percent));
-            unsigned period = easyinput_oled_precharge(s_is_sleeping ? 1 : percent);
-            if (precharge != period) {
-                const uint8_t timing[] = {0xd9, period};
-                err = commands(timing, sizeof(timing));
-                if (err == ESP_OK) precharge = period;
-                ESP_LOGI(TAG, "precharge diag: requested=%d sleeping=%d command=0xd9 value=0x%02x result=%s",
-                         percent, (int)s_is_sleeping, period, esp_err_to_name(err));
-            }
-            if (err == ESP_OK && contrast != level) {
-                const uint8_t brightness[] = {0x81, level};
-                err = commands(brightness, sizeof(brightness)); contrast = level;
-                // 仅记录固定参数和传输结果；ESP_OK不代表已测得光学亮度变化。
-                ESP_LOGI(TAG, "brightness diag: requested=%d sleeping=%d dark=0 command=0x81 value=0x%02x action=write result=%s",
-                         percent, (int)s_is_sleeping, level, esp_err_to_name(err));
-            } else if (err == ESP_OK && (percent != logged_percent || s_is_sleeping != logged_sleeping || logged_dark)) {
-                ESP_LOGI(TAG, "brightness diag: requested=%d sleeping=%d dark=0 command=0x81 value=0x%02x action=cached result=not_sent",
-                         percent, (int)s_is_sleeping, level);
-            }
-            if (err == ESP_OK && (first || memcmp(frames, frames + 1024, 1024))) {
-                err = display_frame(frames);
-                if (err == ESP_OK) { memcpy(frames + 1024, frames, 1024); first = false; }
-            }
-            if (err == ESP_OK && !on) {
-                const uint8_t enable[] = {0xaf}; err = commands(enable, sizeof(enable)); on = err == ESP_OK;
-                ESP_LOGI(TAG, "power diag: command=0xaf result=%s", esp_err_to_name(err));
-            }
+        render(frames, voice);
+        bool low_glow = s_is_sleeping || s_radio_dim;
+        unsigned level = low_glow ? 1 : (1 + easyinput_brightness_scale(63, percent));
+        unsigned period = easyinput_oled_precharge(low_glow ? 1 : percent);
+        if (precharge != period) {
+            const uint8_t timing[] = {0xd9, period};
+            err = commands(timing, sizeof(timing));
+            if (err == ESP_OK) precharge = period;
+            ESP_LOGI(TAG, "precharge diag: requested=%d low_glow=%d command=0xd9 value=0x%02x result=%s",
+                     percent, (int)low_glow, period, esp_err_to_name(err));
+        }
+        if (err == ESP_OK && contrast != level) {
+            const uint8_t brightness[] = {0x81, level};
+            err = commands(brightness, sizeof(brightness)); contrast = level;
+            // 仅记录固定参数和传输结果；ESP_OK不代表已测得光学亮度变化。
+            ESP_LOGI(TAG, "brightness diag: requested=%d low_glow=%d radio=%d command=0x81 value=0x%02x action=write result=%s",
+                     percent, (int)low_glow, (int)dark, level, esp_err_to_name(err));
+        } else if (err == ESP_OK && (percent != logged_percent || low_glow != logged_low_glow || dark != logged_dark)) {
+            ESP_LOGI(TAG, "brightness diag: requested=%d low_glow=%d radio=%d command=0x81 value=0x%02x action=cached result=not_sent",
+                     percent, (int)low_glow, (int)dark, level);
+        }
+        if (err == ESP_OK && (first || memcmp(frames, frames + 1024, 1024))) {
+            err = display_frame(frames);
+            if (err == ESP_OK) { memcpy(frames + 1024, frames, 1024); first = false; }
+        }
+        if (err == ESP_OK && !on) {
+            const uint8_t enable[] = {0xaf}; err = commands(enable, sizeof(enable)); on = err == ESP_OK;
+            ESP_LOGI(TAG, "power diag: command=0xaf result=%s", esp_err_to_name(err));
         }
         logged_percent = percent;
-        logged_sleeping = s_is_sleeping;
+        logged_low_glow = low_glow;
         logged_dark = dark;
-        if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(500));
+        bool fast_refresh = !low_glow && (dark || voice_dial_mode() == VOICE_DIAL_RADIO);
+        if (err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(fast_refresh ? 150 : 500));
     }
     ESP_LOGE(TAG, "display stopped: %s; check J4 wiring and 3.3V pull-ups", esp_err_to_name(err));
     if (s_device) i2c_master_bus_rm_device(s_device);

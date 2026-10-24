@@ -12,13 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OledTextTest(unittest.TestCase):
-    def test_radio_dark_mode_only_overridden_for_selection(self):
+    def test_radio_auto_dim_and_low_glow_in_oled_task(self):
         source = (ROOT / 'main/easyinput_oled.c').read_text(encoding='utf-8')
         task = source[source.index('static void oled_task('):]
         self.assertIn('led_status_oled_snapshot(&voice, &dark);', task)
-        self.assertEqual(re.findall(r'[^\n]*\bdark = false;', task),
-                         ['        if (voice_dial_mode() == VOICE_DIAL_RADIO) dark = false;'])
-        self.assertIn('const uint8_t off[] = {0xae}', task)
+        self.assertIn('bool low_glow = s_is_sleeping || s_radio_dim;', task)
+        self.assertNotIn('const uint8_t off[] = {0xae}', task)
+        self.assertIn('fast_refresh ? 150 : 500', task)
 
     def test_right_column_labels_fit(self):
         source = (ROOT / 'main/easyinput_oled.c').read_text(encoding='utf-8')
@@ -60,14 +60,21 @@ typedef enum { LED_VOICE_IDLE, LED_VOICE_LISTENING, LED_VOICE_END_CANDIDATE,
 static int net = NET_READY, mv = 3900;
 static bool muted, paused, external, charging, halted;
 static int64_t now = 100000000LL, s_last_active_time;
+static int s_last_radio = -1;
+static bool s_last_muted;
 static atomic_llong s_headpat_until;
-static bool s_is_sleeping;
+static bool s_is_sleeping, s_radio_dim;
 static char rows[8][24];
 static const uint8_t *last_avatar;
 static voice_dial_mode_t dial;
-static int radio_ch = -1;
+static int radio_ch = -1, radio_kbps = 128, radio_min = 58, radio_vu = 6;
 static voice_dial_mode_t voice_dial_mode(void) { return dial; }
 static int voice_radio_station(void) { return radio_ch; }
+static void voice_radio_telemetry(int *bitrate_kbps, int *remain_min, int *vu_level) {
+    if (bitrate_kbps) *bitrate_kbps = radio_kbps;
+    if (remain_min) *remain_min = radio_min;
+    if (vu_level) *vu_level = radio_vu;
+}
 static void led_status_oled_failure(const char **status, const char **hint) {
     *status = "NET: DNS ERROR"; *hint = "CHECK NETWORK";
 }
@@ -122,21 +129,45 @@ int main(void) {
     assert(!strcmp(rows[2], "MIC: MUTED"));
     muted = false; dial = VOICE_DIAL_RADIO; radio_ch = 0;
     render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[0], "TinyPal CH01/12"));
+    assert(!strcmp(rows[1], "PICK STATION"));
     assert(!strcmp(rows[2], "FM: DONGAN 101"));
     assert(!strcmp(rows[3], "PRESS DIAL: OK"));
     assert(!strcmp(rows[7], "RADIO: TURN TO PICK"));
     radio_ch = 11;
     render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[0], "TinyPal CH12/12"));
     assert(!strcmp(rows[2], "FM: HEART 102.7"));
     dial = VOICE_DIAL_VOLUME;
     render(frame, LED_VOICE_IDLE);
+    assert(!s_radio_dim && !s_is_sleeping);
+    assert(!strcmp(rows[0], "TinyPal CH12/12"));
+    assert(!strcmp(rows[1], "ON AIR 128k 58m"));
     assert(!strcmp(rows[2], "FM: HEART 102.7"));
-    assert(!strcmp(rows[3], "S6 TO STOP"));
-    assert(!strcmp(rows[7], "S6 STOP  S7 NEXT"));
+    assert(!strcmp(rows[3], "VU ||||||...."));
+    assert(!strcmp(rows[7], "S6 STOP  S7 NEXT/SEL"));
+    radio_kbps = 0; radio_min = 60; radio_vu = 0;
+    render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[1], "ON AIR LIVE 60m"));
+    assert(!strcmp(rows[3], "VU .........."));
+    radio_kbps = 128; radio_min = 58; radio_vu = 6;
+    charging = true;
+    now += 15000001LL;
+    render(frame, LED_VOICE_IDLE);
+    assert(s_radio_dim && !s_is_sleeping);
+    assert(last_avatar == s_robot_idle);
+    assert(!strcmp(rows[3], "DIM: DIAL WAKE"));
+    easyinput_oled_headpat();
+    render(frame, LED_VOICE_IDLE);
+    assert(!s_radio_dim);
+    assert(!strcmp(rows[3], "VU ||||||...."));
+    charging = false;
     radio_ch = 107;
     render(frame, LED_VOICE_IDLE);
+    assert(!strcmp(rows[0], "TinyPal CH08/12"));
     assert(!strcmp(rows[2], "RADIO: LOADING"));
     assert(!strcmp(rows[3], "FM: SG YES 933"));
+    assert(!strcmp(rows[7], "S6 STOP  S7 NEXT/SEL"));
     radio_ch = -1;
     assert(battery_percent_estimate(0) == -1);
     assert(battery_percent_estimate(-1) == -1);

@@ -3,6 +3,17 @@
 #include <stdint.h>
 #include "esp_err.h"
 
+typedef struct {
+    bool active;
+    bool playing;
+    bool selecting;
+    uint8_t station_index;
+    uint8_t station_count;
+    uint16_t bitrate_kbps;
+    uint8_t remain_min;
+    uint8_t vu_level;
+} radio_telemetry_t;
+
 esp_err_t radio_init(void);
 void radio_toggle(void);
 void radio_next(void);
@@ -10,6 +21,7 @@ void radio_select_mode(void);
 bool radio_select_steps(int steps);
 bool radio_select_confirm(void);
 int radio_station(void);
+void radio_get_telemetry(radio_telemetry_t *out);
 // 仅由内部RAM栈的dial任务周期调用，合并保存已确认的频道。
 void radio_poll_storage(void);
 bool radio_enabled(void);

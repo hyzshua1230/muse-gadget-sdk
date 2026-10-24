@@ -152,6 +152,14 @@ int main(void) {
     assert(output(&audio, 12, 1, true) == 0);
     for (int i = 0; i < 24; ++i) assert(observed[i] == (i < 12 ? 6553600 : -6553600));
     assert(audio.prompt_pos == 12);
+    assert(s.vu_level == 0);
+    for (int i = 0; i < 24; ++i) audio.out[i] = 18000 * 65536;
+    audio.duck = 1.0f;
+    assert(output(&audio, 12, 1, false) == 0);
+    assert(s.vu_level == 10);
+    for (int i = 0; i < 24; ++i) audio.out[i] = 0;
+    now += 39999; assert(output(&audio, 12, 1, false) == 0); assert(s.vu_level == 10);
+    now += 1; assert(output(&audio, 12, 1, false) == 0); assert(s.vu_level == 9);
     return 0;
 }
 '''
@@ -251,8 +259,11 @@ int main(void) {
             self.skipTest("主机C编译器不可用，状态执行测试未验证")
         source = (ROOT / "main/radio.c").read_text(encoding="utf-8")
         state = source[source.index("typedef struct {"):source.index("static portMUX_TYPE")]
+        header = (ROOT / "main/radio.h").read_text(encoding="utf-8")
+        telemetry_type = block(header, "typedef struct {") + " radio_telemetry_t;\n"
         functions = "\n".join(block(source, name) for name in (
-            "static state_t snapshot(", "bool radio_enabled(", "static void select_station_locked(", "static void set_enabled(",
+            "static state_t snapshot(", "bool radio_enabled(", "void radio_get_telemetry(",
+            "static void select_station_locked(", "static void set_enabled(",
             "void radio_toggle(", "void radio_next(", "void radio_select_mode(",
             "bool radio_select_steps(", "bool radio_select_confirm(", "bool radio_pause(",
             "static bool current(unsigned epoch) {",
@@ -271,7 +282,7 @@ static bool release_output;
 static int64_t esp_timer_get_time(void) { return now; }
 static void vTaskDelay(unsigned ms);
 '''
-        harness += state + functions
+        harness += telemetry_type + state + functions
         harness += r'''
 static void vTaskDelay(unsigned ms) {
     now += ms * 1000LL;
@@ -299,8 +310,16 @@ int main(void) {
     assert(radio_pause(false));
     assert(!s.blocked && s.deadline == deadline);
     s.output = false;
+    s.bitrate_kbps = 128; s.vu_level = 7; s.output = true;
+    radio_telemetry_t tel = {0};
+    radio_get_telemetry(&tel);
+    assert(tel.active && tel.playing && !tel.selecting && tel.station_index == 1 &&
+           tel.station_count == 12 && tel.bitrate_kbps == 128 && tel.vu_level == 7 && tel.remain_min == 60);
+    s.output = false;
     radio_select_mode();
     assert(radio_select_steps(11) && s.candidate == 0);
+    radio_get_telemetry(&tel);
+    assert(tel.active && !tel.playing && tel.selecting && tel.station_index == 0 && tel.vu_level == 0);
     assert(radio_select_confirm() && s.station == 0);
     assert(s.deadline == deadline);
     radio_select_mode();
